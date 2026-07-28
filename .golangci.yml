@@ -1,0 +1,58 @@
+version: "2"
+
+run:
+  # Lint the privileged tests too; they are excluded from `make test`, not from
+  # review.
+  build-tags:
+    - integration
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint # SSOT §5 requires %w wrapping and errors.Is/As over comparisons
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    errcheck:
+      # SSOT §13.7 forbids silent error suppression; blank assignments are the
+      # documented escape hatch for genuinely ignorable cleanup errors and must
+      # stay visible in review.
+      check-blank: true
+    revive:
+      rules:
+        - name: exported # SSOT §4: exported identifiers need doc comments
+        - name: package-comments
+        - name: error-strings
+        - name: context-as-argument
+        - name: indent-error-flow
+  exclusions:
+    rules:
+      # Test helpers may assert rather than propagate.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unparam
+      # internal/cli owns user-facing terminal output (SSOT §6). A failed write
+      # to stdout or stderr has no recovery path — there is nowhere left to
+      # report it, since the report would go to the same stream — so these
+      # writes are deliberately unchecked. This is scoped to the CLI on
+      # purpose: everywhere else, an unchecked error is a bug.
+      - path: internal/cli/
+        linters:
+          - errcheck
+        text: 'fmt\.(Fprint|Fprintf|Fprintln)'
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/stevenstank/forge
