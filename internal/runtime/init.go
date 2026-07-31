@@ -8,6 +8,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
 )
 
@@ -70,6 +71,16 @@ type initPayload struct {
 	Namespace namespace.Config `json:"namespace"`
 	Command   []string         `json:"command"`
 	Env       []string         `json:"env"`
+
+	// Mount is the container's filesystem plan, or nil for a container that
+	// runs against the host's filesystem. Nil is what preserves Stage 1
+	// behaviour: no mounts, no pivot.
+	Mount *mount.Plan `json:"mount,omitempty"`
+
+	// WorkingDir is the directory to enter before execve, inside the
+	// container. Empty means wherever the pivot left the process, which is
+	// the container's "/".
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 // Init is the container's entry point, executed by the re-exec'd forge binary
@@ -78,6 +89,18 @@ type initPayload struct {
 // It must only ever run in that child process: the whole point of the
 // operations it performs is that they affect the caller's namespaces, so
 // running it anywhere else would reconfigure the host.
+//
+// The order is load-bearing at every step:
+//
+//	namespace.Apply    the mount tree is made private first, or every mount
+//	                   below it propagates to the host (FR-1.3)
+//	mount.Apply        the container's mounts, made while the host filesystem
+//	                   is still reachable — bind sources are host paths, and
+//	                   after the pivot there is no host left to bind from
+//	mount.PivotRoot    "/" becomes the container's root; the old one is
+//	                   detached and unreachable (FR-2.1)
+//	chdir              the working directory, now a container path
+//	execve             the process becomes the container
 //
 // On success Init does not return — execve replaces this process with the
 // container's binary, which inherits its PID. Inside a PID namespace that PID
@@ -92,12 +115,41 @@ func Init() error {
 		return err
 	}
 
+	if payload.Mount != nil {
+		if err := mount.Apply(*payload.Mount); err != nil {
+			return err
+		}
+		if err := mount.PivotRoot(payload.Mount.Root); err != nil {
+			return err
+		}
+	}
+
+	if err := enterWorkingDir(payload.WorkingDir); err != nil {
+		return err
+	}
+
 	if err := syscall.Exec(payload.Command[0], payload.Command, payload.Env); err != nil {
 		return fmt.Errorf("executing %s: %w", payload.Command[0], err)
 	}
 
 	// Unreachable: a successful execve never returns.
 	return errors.New("execve returned without an error")
+}
+
+// enterWorkingDir moves the container's init into its working directory.
+//
+// An empty directory leaves the process where it is: after a pivot that is the
+// container's "/", and without one it is wherever forge was run from, which is
+// the Stage 1 behaviour. A missing directory is reported by name — silently
+// starting in "/" instead would turn a typo into a puzzle.
+func enterWorkingDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if err := os.Chdir(dir); err != nil {
+		return fmt.Errorf("entering working directory %s: %w", dir, err)
+	}
+	return nil
 }
 
 // readInitPayload reads and decodes the configuration the parent wrote to the
@@ -144,6 +196,14 @@ func decodeInitPayload(r io.Reader) (initPayload, error) {
 	}
 	if payload.Command[0] == "" {
 		return initPayload{}, ErrNoCommand
+	}
+	// The parent validated this plan too. Validating it again here is not
+	// redundant: this is the process that would perform the mounts, and a
+	// destination that escapes the container root must never reach mount(2).
+	if payload.Mount != nil {
+		if err := payload.Mount.Validate(); err != nil {
+			return initPayload{}, err
+		}
 	}
 
 	return payload, nil

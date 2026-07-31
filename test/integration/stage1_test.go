@@ -23,78 +23,54 @@ import (
 	"github.com/stevenstank/forge/internal/runtime"
 )
 
-// These tests exercise Stage 1 against the real kernel. The container's binary
-// is always this test binary re-executed in a helper mode, which keeps the
-// tests independent of whatever binaries the host happens to have.
+// These tests exercise Stage 1 against the real kernel: process, hostname and
+// mount-table isolation, with the container still sharing the host filesystem.
+// The shared harness lives in harness_test.go.
 
-const (
-	helperEnv     = "FORGE_INTEGRATION_HELPER"
-	helperDirEnv  = "FORGE_INTEGRATION_DIR"
-	helperCodeEnv = "FORGE_INTEGRATION_EXIT_CODE"
-)
-
-// readyMarker is what a long-running helper prints once it is up, so tests can
-// synchronise on it instead of sleeping (SSOT §7).
-const readyMarker = "ready"
-
-func TestMain(m *testing.M) {
-	// This binary plays the role cmd/forge plays in production: Forge starts a
-	// container by re-executing the *current* executable as its container init,
-	// so the test binary must route that command to runtime.Init exactly as the
-	// real CLI does. Without this it would re-enter the test suite inside every
-	// container it starts. See ADR-0008.
-	if runtime.IsInitCommand(os.Args) {
-		if err := runtime.Init(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(runtime.InitExitCode)
-		}
-		os.Exit(runtime.InitExitCode)
-	}
-
-	switch os.Getenv(helperEnv) {
-	case "":
-		os.Exit(m.Run())
-
+// stage1Helper runs the container-side half of a Stage 1 test. It reports
+// whether it recognised the mode; TestMain tries each stage in turn.
+func stage1Helper(mode string) (int, bool) {
+	switch mode {
 	case "print-pid":
 		// getpid(2), not /proc: inside a PID namespace this is the container's
 		// own view of itself.
 		fmt.Println(os.Getpid())
-		os.Exit(0)
+		return 0, true
 
 	case "print-pid-ns":
-		os.Exit(printNamespace("pid"))
+		return printNamespace("pid"), true
 
 	case "print-mount-ns":
-		os.Exit(printNamespace("mnt"))
+		return printNamespace("mnt"), true
 
 	case "print-uts-ns":
-		os.Exit(printNamespace("uts"))
+		return printNamespace("uts"), true
 
 	case "print-hostname":
 		name, err := os.Hostname()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return 1, true
 		}
 		fmt.Println(name)
-		os.Exit(0)
+		return 0, true
 
 	case "mount-tmpfs":
-		os.Exit(mountTmpfsHelper())
+		return mountTmpfsHelper(), true
 
 	case "exit":
 		code, err := strconv.Atoi(os.Getenv(helperCodeEnv))
 		if err != nil {
-			os.Exit(254)
+			return 254, true
 		}
-		os.Exit(code)
+		return code, true
 
 	case "sleep-forever":
 		fmt.Println(readyMarker)
 		select {}
 
 	default:
-		os.Exit(252)
+		return 0, false
 	}
 }
 
@@ -127,71 +103,6 @@ func mountTmpfsHelper() int {
 		return 1
 	}
 	return 0
-}
-
-// requireRoot skips a test that cannot run without CAP_SYS_ADMIN.
-func requireRoot(t *testing.T) {
-	t.Helper()
-
-	if os.Geteuid() != 0 {
-		t.Skip("stage 1 integration tests need root: run `sudo -E make test-integration`")
-	}
-}
-
-// result is everything a test wants to know about a finished container.
-type result struct {
-	status process.Status
-	stdout string
-	stderr string
-}
-
-// runContainer runs spec to completion and returns its output. A container that
-// fails to start is a test failure; a container that exits non-zero is not.
-func runContainer(ctx context.Context, t *testing.T, spec runtime.Spec) result {
-	t.Helper()
-
-	var stdout, stderr, logs bytes.Buffer
-	spec.Stdout = &stdout
-	spec.Stderr = &stderr
-
-	status, err := runtime.NewRunner(logging.New(&logs, slog.LevelDebug)).Run(ctx, spec)
-	t.Logf("forge log:\n%s", logs.String())
-	if err != nil {
-		t.Fatalf("Run() = %v\ncontainer stderr: %s", err, stderr.String())
-	}
-
-	return result{
-		status: status,
-		stdout: strings.TrimSpace(stdout.String()),
-		stderr: strings.TrimSpace(stderr.String()),
-	}
-}
-
-// helperSpec returns a Spec that runs this test binary in the given mode.
-func helperSpec(t *testing.T, mode string, env ...string) runtime.Spec {
-	t.Helper()
-
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable() = %v", err)
-	}
-
-	return runtime.Spec{
-		Command: []string{exe},
-		Env:     append([]string{helperEnv + "=" + mode}, env...),
-	}
-}
-
-// hostNamespace returns the inode identity of one of the test process's
-// namespaces, for comparison against a container's.
-func hostNamespace(t *testing.T, kind string) string {
-	t.Helper()
-
-	link, err := os.Readlink("/proc/self/ns/" + kind)
-	if err != nil {
-		t.Fatalf("reading host %s namespace: %v", kind, err)
-	}
-	return link
 }
 
 // --- FR-1.1: process isolation via CLONE_NEWPID ---------------------------
@@ -407,8 +318,13 @@ func TestCancellingTheContextKillsTheContainer(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 
+	runner, err := runtime.NewRunner(logging.New(&logs, slog.LevelDebug), runtime.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewRunner() = %v", err)
+	}
+
 	go func() {
-		status, err := runtime.NewRunner(logging.New(&logs, slog.LevelDebug)).Run(ctx, spec)
+		status, err := runner.Run(ctx, spec)
 		// Unblock any reader still waiting on the container's stdout.
 		_ = stdoutWriter.Close()
 		done <- outcome{status, err}
@@ -471,15 +387,4 @@ func TestNoHostResidueAfterRun(t *testing.T) {
 	if after := hostMountCount(t); after != mountsBefore {
 		t.Errorf("host mount count changed from %d to %d; a mount leaked", mountsBefore, after)
 	}
-}
-
-// hostMountCount returns the number of entries in the host's mount table.
-func hostMountCount(t *testing.T) int {
-	t.Helper()
-
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		t.Fatalf("reading host mountinfo: %v", err)
-	}
-	return len(strings.Split(strings.TrimSpace(string(data)), "\n"))
 }

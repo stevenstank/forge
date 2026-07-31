@@ -88,10 +88,153 @@ func TestRunCommandHelp(t *testing.T) {
 	}
 
 	got := stderr.String()
-	for _, want := range []string{"forge run", "<path>", "-hostname", "does not search PATH"} {
+	for _, want := range []string{
+		"forge run", "<path>", "-hostname", "does not search PATH",
+		"-rootfs", "-mount", "-read-only", "-workdir",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("run help does not mention %q:\n%s", want, got)
 		}
+	}
+}
+
+// --- Stage 2 --------------------------------------------------------------
+
+// TestRunCommandStage2ArgumentErrors covers the flags Stage 2 adds. Everything
+// here is rejected before a container is started, which is why it needs no root.
+func TestRunCommandStage2ArgumentErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantStderr string
+	}{
+		{
+			name:       "mount without a rootfs",
+			args:       []string{"run", "-mount", "/host/data:/data", "/bin/echo", "hi"},
+			wantStderr: "rootfs",
+		},
+		{
+			name:       "read-only without a rootfs",
+			args:       []string{"run", "-read-only", "/bin/echo", "hi"},
+			wantStderr: "rootfs",
+		},
+		{
+			name:       "workdir without a rootfs",
+			args:       []string{"run", "-workdir", "/data", "/bin/echo", "hi"},
+			wantStderr: "rootfs",
+		},
+		{
+			name:       "malformed mount spec",
+			args:       []string{"run", "-rootfs", "/srv/alpine", "-mount", "/host/data", "/bin/sh"},
+			wantStderr: "/host/data",
+		},
+		{
+			name:       "unknown mount option",
+			args:       []string{"run", "-rootfs", "/srv/alpine", "-mount", "/host/data:/data:rw", "/bin/sh"},
+			wantStderr: "rw",
+		},
+		{
+			name:       "relative rootfs",
+			args:       []string{"run", "-rootfs", "images/alpine", "/bin/sh"},
+			wantStderr: "absolute",
+		},
+		{
+			name:       "relative workdir",
+			args:       []string{"run", "-rootfs", "/srv/alpine", "-workdir", "data", "/bin/sh"},
+			wantStderr: "absolute",
+		},
+		{
+			name:       "mount destination escaping the container root",
+			args:       []string{"run", "-rootfs", "/srv/alpine", "-mount", "/host/data:/../etc", "/bin/sh"},
+			wantStderr: "/../etc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			a, stdout, stderr := newTestApp(commands()...)
+
+			if got := a.run(t.Context(), tt.args); got != ExitUsage {
+				t.Errorf("exit code = %d, want %d (stderr: %q)", got, ExitUsage, stderr)
+			}
+			if !strings.Contains(stderr.String(), tt.wantStderr) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr, tt.wantStderr)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want it empty", stdout)
+			}
+		})
+	}
+}
+
+// TestParseRunMountFlags pins that -mount is repeatable and that the parsed
+// order is the order the user gave, which is what decides shadowing.
+func TestParseRunMountFlags(t *testing.T) {
+	t.Parallel()
+
+	spec, err := parseRunSpec([]string{
+		"-rootfs", "/srv/alpine",
+		"-mount", "/host/one:/one",
+		"-mount", "/host/two:/two:ro",
+		"-read-only",
+		"-workdir", "/one",
+		"/bin/sh", "-c", "true",
+	})
+	if err != nil {
+		t.Fatalf("parseRunSpec() = %v", err)
+	}
+
+	if spec.Rootfs != "/srv/alpine" {
+		t.Errorf("Rootfs = %q, want %q", spec.Rootfs, "/srv/alpine")
+	}
+	if !spec.ReadonlyRoot {
+		t.Error("ReadonlyRoot = false, want true")
+	}
+	if spec.WorkingDir != "/one" {
+		t.Errorf("WorkingDir = %q, want %q", spec.WorkingDir, "/one")
+	}
+	if len(spec.Mounts) != 2 {
+		t.Fatalf("got %d mounts, want 2", len(spec.Mounts))
+	}
+	if spec.Mounts[0].Destination != "/one" || spec.Mounts[1].Destination != "/two" {
+		t.Errorf("mount order = %q, %q; want /one then /two",
+			spec.Mounts[0].Destination, spec.Mounts[1].Destination)
+	}
+	if !spec.Mounts[1].NeedsRemount() {
+		t.Error("the second mount is not read-only; the :ro suffix was dropped")
+	}
+
+	// The command is everything after the flags, unchanged.
+	if strings.Join(spec.Command, " ") != "/bin/sh -c true" {
+		t.Errorf("Command = %q, want %q", spec.Command, "/bin/sh -c true")
+	}
+}
+
+// TestParseRunSpecWithoutStage2Flags confirms the Stage 1 invocation still
+// produces a Stage 1 spec: no rootfs, no mounts, nothing to pivot into.
+func TestParseRunSpecWithoutStage2Flags(t *testing.T) {
+	t.Parallel()
+
+	spec, err := parseRunSpec([]string{"/bin/echo", "hello"})
+	if err != nil {
+		t.Fatalf("parseRunSpec() = %v", err)
+	}
+
+	if spec.Rootfs != "" {
+		t.Errorf("Rootfs = %q, want empty", spec.Rootfs)
+	}
+	if len(spec.Mounts) != 0 {
+		t.Errorf("Mounts = %v, want none", spec.Mounts)
+	}
+	if spec.ReadonlyRoot {
+		t.Error("ReadonlyRoot = true, want false")
+	}
+	if spec.WorkingDir != "" {
+		t.Errorf("WorkingDir = %q, want empty", spec.WorkingDir)
 	}
 }
 

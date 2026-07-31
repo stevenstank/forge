@@ -104,11 +104,14 @@ sudo ./bin/forge run /bin/echo "hello from forge"
 
 ## Example Commands
 
-> **Stage 1 is the current stage.** `forge run` takes a **path to a binary on
-> the host**, not an image reference — images arrive in Stage 5. The command
-> runs as PID 1 inside new PID, UTS and mount namespaces. The commands listed
-> under later stages below do not exist yet; `forge -h` always lists exactly
-> what is implemented.
+> **Stage 2 is the current stage.** `forge run` takes a **path to a binary**,
+> not an image reference — images arrive in Stage 5. Without `-rootfs` that path
+> is on the host and the container shares the host's filesystem, exactly as in
+> Stage 1. With `-rootfs` it is a path *inside* the container's own root
+> filesystem. The commands listed under later stages below do not exist yet;
+> `forge -h` always lists exactly what is implemented.
+
+### Stage 1 — process isolation
 
 ```bash
 # Run a command in an isolated container
@@ -118,7 +121,7 @@ sudo forge run /bin/echo "hello from forge"
 sudo forge run /bin/sh -c 'echo "I am pid $$"'      # → I am pid 1
 
 # Give the container a hostname (default: the container ID)
-sudo forge run --hostname sandbox /bin/hostname
+sudo forge run -hostname sandbox /bin/hostname
 
 # Mounts made inside the container never reach the host
 sudo forge run /bin/sh -c 'mount -t tmpfs tmpfs /mnt && ls /mnt'
@@ -129,6 +132,49 @@ sudo forge run /bin/sh -c 'exit 42'; echo $?        # → 42
 # Turn up the detail
 sudo forge --log-level debug run /bin/true
 ```
+
+### Stage 2 — filesystem isolation
+
+`-rootfs` takes any unpacked root filesystem tree. Until Stage 5 pulls images,
+the quickest way to get one:
+
+```bash
+curl -sL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz \
+  | sudo tar -xz -C /srv/alpine
+```
+
+```bash
+# The container's / is the rootfs, not the host's
+sudo forge run -rootfs /srv/alpine /bin/ls /
+
+# The host is gone: no /home, no /srv, nothing to climb back to
+sudo forge run -rootfs /srv/alpine /bin/ls /home     # → no such file or directory
+
+# /proc is the container's own, so ps finally tells the truth
+sudo forge run -rootfs /srv/alpine /bin/ps           # → one process, PID 1
+
+# Bind-mount a host directory in
+sudo forge run -rootfs /srv/alpine -mount /srv/data:/data /bin/ls /data
+
+# ...read-only, so the container cannot write back to the host
+sudo forge run -rootfs /srv/alpine -mount /srv/data:/data:ro \
+  /bin/sh -c 'echo nope > /data/file'                # → Read-only file system
+
+# An immutable root with one writable directory
+sudo forge run -rootfs /srv/alpine -read-only -mount /tmp/scratch:/scratch /bin/sh
+
+# Start somewhere other than /
+sudo forge run -rootfs /srv/alpine -workdir /etc /bin/pwd    # → /etc
+
+# Nothing is left behind: no mounts, no directories
+sudo forge run -rootfs /srv/alpine /bin/true
+ls /var/lib/forge/containers                         # → empty
+```
+
+> **Containers started from the same `-rootfs` share it, and writes go back to
+> the source tree.** Stage 2 bind-mounts the tree rather than copying it;
+> per-container copy-on-write arrives with image layering in Stage 5. Use
+> `-read-only` if that matters to you.
 
 Later stages will add:
 
@@ -151,7 +197,7 @@ its own right.
 | Stage | Focus | Key Mechanisms | Status |
 |---|---|---|---|
 | 1 | Process Isolation | PID / UTS / mount namespaces | ✅ Complete |
-| 2 | Filesystem Isolation | `pivot_root`, bind mounts | Not started |
+| 2 | Filesystem Isolation | `pivot_root`, bind mounts | ✅ Complete |
 | 3 | Resource Limits | cgroups v2 (memory, CPU, pids) | Not started |
 | 4 | Networking | network namespaces, veth, bridge, NAT | Not started |
 | 5 | Images | OCI image pull, unpack, layer cache | Not started |
@@ -189,7 +235,9 @@ description of each package's responsibilities and boundaries.
 ## Development Philosophy
 
 - **Standard library first.** New dependencies require an ADR justifying
-  them (see [SSOT.md §10](./SSOT.md#10-dependency-rules)).
+  them (see [SSOT.md §10](./SSOT.md#10-dependency-rules)). Forge has exactly
+  one: `golang.org/x/sys/unix`, for syscalls the frozen `syscall` package will
+  not grow ([ADR-0013](./docs/adr/0013-golang-x-sys-dependency.md)).
 - **Test-driven.** Tests are written alongside — ideally before —
   implementation. See [SSOT.md §7](./SSOT.md#7-testing-strategy).
 - **One package, one kernel mechanism.** The package layout mirrors the

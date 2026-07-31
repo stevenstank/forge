@@ -250,6 +250,14 @@ creation.
   `/var/lib/forge/containers`).
 - Subcommands (final set, delivered incrementally by stage):
   - `forge run [flags] <image|rootfs-path> [cmd] [args...]`
+    - **Until Stage 5**, the root filesystem is named by a `-rootfs` *flag*
+      rather than positionally, and the positional argument is the command:
+      `forge run -rootfs <dir> <cmd> [args...]`. Omitting `-rootfs` runs the
+      command against the host's filesystem, which is Stage 1's behaviour and
+      remains valid. The positional `<image>` form arrives with images in
+      Stage 5, when there is a reference to resolve.
+    - Stage 2 flags: `-rootfs`, `-mount src:dst[:opts]` (repeatable),
+      `-read-only`, `-workdir`.
   - `forge ps [-a]`
   - `forge exec <container-id> <cmd> [args...]`
   - `forge stop [-t timeout] <container-id>`
@@ -436,7 +444,7 @@ What becomes easier or harder as a result?
 
 | ID | Title | Status |
 |---|---|---|
-| 0001 | Use `pivot_root` instead of `chroot` for rootfs isolation | Proposed |
+| 0001 | Use `pivot_root` instead of `chroot` for rootfs isolation | Accepted |
 | 0002 | Use direct cgroups v2 filesystem writes instead of a cgroups library | Proposed |
 | 0003 | Layer assembly strategy: OverlayFS vs. explicit layer extraction | Proposed |
 | 0004 | CLI flag library choice (stdlib `flag` vs. `cobra`) | Accepted |
@@ -445,6 +453,10 @@ What becomes easier or harder as a result?
 | 0007 | Introduce `internal/runtime` in Stage 1 | Accepted |
 | 0008 | Child-side namespace setup via re-executing `/proc/self/exe` | Accepted |
 | 0009 | `forge run` output streams and exit status | Accepted |
+| 0010 | Per-container rootfs layout, and how Stage 2 populates it | Accepted |
+| 0011 | The mount plan is built by `runtime` and executed by `mount` | Accepted |
+| 0012 | All container mounts are made child-side, before `pivot_root` | Accepted |
+| 0013 | Depend on `golang.org/x/sys/unix` for syscalls | Accepted |
 
 Each must be filled in and marked `Accepted` before the corresponding stage's
 implementation is merged.

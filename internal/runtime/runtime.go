@@ -2,23 +2,34 @@
 // lifecycle.
 //
 // Per SSOT §13.2 it is the only orchestrator: the primitive packages never call
-// one another, and every cross-package sequencing decision lives here. Stage 1
-// composes exactly two primitives, internal/namespace and internal/process.
+// one another, and every cross-package sequencing decision lives here. Stage 2
+// composes four primitives — internal/namespace, internal/process,
+// internal/rootfs and internal/mount.
 //
 // # How a container starts
 //
-// Namespaces are created by clone(2), but two of Stage 1's requirements can
-// only be satisfied by code running *inside* the new namespaces: setting the
-// container's hostname (FR-1.2) and detaching its mount tree from the host's
-// (FR-1.3). Forge therefore starts itself rather than the container's binary:
+// Namespaces are created by clone(2), but most of what makes a container a
+// container can only be done by code running *inside* the new namespaces:
+// setting the hostname (FR-1.2), detaching the mount tree from the host's
+// (FR-1.3), and building the container's root filesystem (FR-2.1, FR-2.2).
+// Forge therefore starts itself rather than the container's binary:
 //
 //	forge run          →  clone(CLONE_NEWPID|NEWUTS|NEWNS)
 //	                        →  /proc/self/exe __init      (this package, Init)
 //	                             →  namespace.Apply
+//	                             →  mount.Apply           (the container's mounts)
+//	                             →  mount.PivotRoot       (its root filesystem)
 //	                             →  execve(user binary)
 //
 // The configuration crosses that boundary as JSON on an inherited pipe. See
 // ADR-0008.
+//
+// # What the parent does
+//
+// The parent creates only directories: <root>/<id>/rootfs, which FR-2.4
+// requires and which the child mounts into. It makes no mounts of its own, so
+// the mounts a container has are exactly the mounts its namespace holds, and
+// the kernel releases all of them when the container exits (ADR-0012).
 package runtime
 
 import (
@@ -29,11 +40,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
 	"github.com/stevenstank/forge/internal/process"
+	"github.com/stevenstank/forge/internal/rootfs"
 )
 
 // InitCommandName is the hidden subcommand Forge re-executes itself as, to run
@@ -45,11 +59,19 @@ const InitCommandName = "__init"
 // the process legible in host tooling such as ps.
 const initArgv0 = "forge-init"
 
+// Config is the runtime's own configuration, as opposed to a container's.
+type Config struct {
+	// Root is the directory per-container root filesystems are stored under,
+	// from the --root flag (SSOT §9).
+	Root string
+}
+
 // Spec describes a container to run. It is the caller's complete statement of
 // intent; this package reads no flags, environment, or global state.
 type Spec struct {
 	// Command is the argument vector to execute inside the container.
-	// Command[0] is the path to the binary.
+	// Command[0] is the path to the binary, resolved inside the container's
+	// root filesystem.
 	Command []string
 
 	// Env is the container's complete environment. Nil means an empty
@@ -60,6 +82,23 @@ type Spec struct {
 	// container ID, which is what Docker does.
 	Hostname string
 
+	// Rootfs is a host directory to use as the container's root filesystem.
+	// Empty means the container shares the host's filesystem, which is what
+	// Stage 1 did and remains valid.
+	Rootfs string
+
+	// Mounts are bind mounts to make inside the container, in addition to the
+	// default set every container gets. Requires Rootfs.
+	Mounts []mount.Mount
+
+	// ReadonlyRoot mounts the container's root filesystem read-only. Requires
+	// Rootfs.
+	ReadonlyRoot bool
+
+	// WorkingDir is the directory the container's binary starts in, inside the
+	// container. Empty means "/". Requires Rootfs.
+	WorkingDir string
+
 	// Stdin, Stdout and Stderr are wired to the container process.
 	Stdin  io.Reader
 	Stdout io.Writer
@@ -69,21 +108,61 @@ type Spec struct {
 // Validate reports whether the spec can be run. It is pure and performs no
 // syscalls, so bad input is rejected before anything is forked.
 func (s Spec) Validate() error {
-	if len(s.Command) == 0 {
+	if len(s.Command) == 0 || s.Command[0] == "" {
 		return ErrNoCommand
 	}
-	if s.Command[0] == "" {
-		return ErrNoCommand
-	}
-	// Stage 1 runs a binary from the host filesystem and has no image to
-	// supply a PATH, so a bare name would be resolved against the *host's*
-	// PATH — a surprise worth refusing outright. Path resolution arrives with
-	// images in Stage 5.
+	// Forge resolves the command inside the container, and a container has no
+	// PATH of its own until images arrive in Stage 5. A bare name would be
+	// resolved against the *host's* PATH — a surprise worth refusing outright.
 	if !strings.Contains(s.Command[0], "/") {
-		return fmt.Errorf("%w: %q is not a path; forge does not search PATH, give a path such as /bin/%s",
+		return fmt.Errorf("%w: %q is not a path; forge does not search PATH, give a path inside the container such as /bin/%s",
 			ErrNotAPath, s.Command[0], s.Command[0])
 	}
-	return nil
+
+	if s.Hostname != "" {
+		// Checked here rather than in Run so an invalid hostname is a usage
+		// error from the CLI rather than a failure part-way through starting a
+		// container.
+		if err := (namespace.Config{UTS: true, Hostname: s.Hostname}).Validate(); err != nil {
+			return err
+		}
+	}
+
+	return s.validateFilesystem()
+}
+
+// validateFilesystem checks the Stage 2 half of the spec.
+func (s Spec) validateFilesystem() error {
+	if s.Rootfs == "" {
+		// Every filesystem option needs something to apply to. Accepting them
+		// silently would produce a container that ignored them.
+		switch {
+		case len(s.Mounts) > 0:
+			return fmt.Errorf("%w: --mount needs a --rootfs to mount into", ErrMountWithoutRootfs)
+		case s.ReadonlyRoot:
+			return fmt.Errorf("%w: --read-only needs a --rootfs to make read-only", ErrMountWithoutRootfs)
+		case s.WorkingDir != "":
+			return fmt.Errorf("%w: --workdir needs a --rootfs to resolve it in", ErrMountWithoutRootfs)
+		}
+		return nil
+	}
+
+	if !filepath.IsAbs(s.Rootfs) {
+		return fmt.Errorf("%w: --rootfs %q must be an absolute path", ErrRootfsNotAbsolute, s.Rootfs)
+	}
+	if s.WorkingDir != "" && !filepath.IsAbs(s.WorkingDir) {
+		return fmt.Errorf("%w: --workdir %q must be an absolute path inside the container",
+			ErrWorkingDirNotAbsolute, s.WorkingDir)
+	}
+
+	// The plan the mounts end up in is validated as a whole once the container
+	// directory is known; this catches what can be known now, in the parent,
+	// before anything is created.
+	return mount.Plan{
+		Source: s.Rootfs,
+		Root:   filepath.Join(string(filepath.Separator), "placeholder"),
+		Mounts: s.Mounts,
+	}.Validate()
 }
 
 // Sentinel errors callers may branch on.
@@ -93,18 +172,36 @@ var (
 
 	// ErrNotAPath reports a command that is a bare name rather than a path.
 	ErrNotAPath = errors.New("command must be a path")
+
+	// ErrRootfsNotAbsolute reports a relative --rootfs, which would resolve
+	// against whatever directory forge was started in.
+	ErrRootfsNotAbsolute = errors.New("root filesystem path must be absolute")
+
+	// ErrWorkingDirNotAbsolute reports a relative --workdir.
+	ErrWorkingDirNotAbsolute = errors.New("working directory must be absolute")
+
+	// ErrMountWithoutRootfs reports a filesystem option given to a container
+	// that has no root filesystem of its own.
+	ErrMountWithoutRootfs = errors.New("option requires a root filesystem")
 )
 
 // Runner runs containers. Construct it with NewRunner.
 type Runner struct {
 	logger *slog.Logger
+	store  *rootfs.Store
 }
 
-// NewRunner returns a Runner that logs through logger. The logger is injected
-// rather than global so every container operation can be correlated by the
-// container_id attribute this package attaches (SSOT §6).
-func NewRunner(logger *slog.Logger) *Runner {
-	return &Runner{logger: logger}
+// NewRunner returns a Runner that logs through logger and stores container root
+// filesystems under cfg.Root, creating that directory if it does not exist.
+//
+// The logger is injected rather than global so every container operation can be
+// correlated by the container_id attribute this package attaches (SSOT §6).
+func NewRunner(logger *slog.Logger, cfg Config) (*Runner, error) {
+	store, err := rootfs.NewStore(cfg.Root, logger)
+	if err != nil {
+		return nil, err
+	}
+	return &Runner{logger: logger, store: store}, nil
 }
 
 // Run creates a container from spec, runs it to completion, and reports how it
@@ -131,6 +228,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	}
 	log := r.logger.With("container_id", id)
 
+	// Everything Forge creates on the host is registered here and released in
+	// reverse order when Run returns, however it returns (SSOT §11.3).
+	cleanup := newCleanupStack(log)
+	defer cleanup.unwind()
+
 	nsCfg := namespace.Config{
 		PID:      true,
 		UTS:      true,
@@ -140,9 +242,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	if nsCfg.Hostname == "" {
 		nsCfg.Hostname = id
 	}
-	// Validate in the parent so a bad hostname is a clear error here rather
-	// than an opaque failure inside the container's init.
-	if err := nsCfg.Validate(); err != nil {
+
+	plan, err := r.prepareFilesystem(ctx, log, id, spec, cleanup)
+	if err != nil {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
 
@@ -152,9 +254,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	}
 
 	payload, err := json.Marshal(initPayload{
-		Namespace: nsCfg,
-		Command:   spec.Command,
-		Env:       spec.Env,
+		Namespace:  nsCfg,
+		Command:    spec.Command,
+		Env:        spec.Env,
+		Mount:      plan,
+		WorkingDir: spec.WorkingDir,
 	})
 	if err != nil {
 		return process.Status{}, fmt.Errorf("encoding init payload: %w", err)
@@ -174,6 +278,65 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	log.Info("container exited", "exit_code", status.Code, "status", status.String())
 
 	return status, nil
+}
+
+// prepareFilesystem creates the container's root filesystem directory and the
+// plan describing what the container's init will mount into it.
+//
+// A spec with no Rootfs returns a nil plan, which is what keeps a Stage 1
+// container running against the host's filesystem: nothing is created, nothing
+// is mounted, and no pivot happens.
+func (r *Runner) prepareFilesystem(
+	ctx context.Context,
+	log *slog.Logger,
+	id string,
+	spec Spec,
+	cleanup *cleanupStack,
+) (*mount.Plan, error) {
+	if spec.Rootfs == "" {
+		return nil, nil
+	}
+
+	source, err := rootfs.ValidateSource(spec.Rootfs)
+	if err != nil {
+		return nil, err
+	}
+	spec.Rootfs = source // a copy; the caller's spec is untouched
+
+	dir, err := r.store.Prepare(id)
+	if err != nil {
+		return nil, err
+	}
+	cleanup.push("removing the container root filesystem", func() error {
+		// Cleanup runs after the container is gone, which includes the case
+		// where ctx was cancelled to kill it. Inheriting that cancellation
+		// would mean an interrupted run leaked exactly what it was cancelled
+		// to release.
+		ctx := context.WithoutCancel(ctx)
+
+		// Nothing Forge does mounts on the host, so this normally finds
+		// nothing. It is here because Store.Remove refuses to delete a tree
+		// with mounts under it, and reconciling residue from a previous
+		// crashed run is the only way that refusal can be hit.
+		if err := mount.Cleanup(ctx, dir.Base); err != nil {
+			return err
+		}
+		return r.store.Remove(ctx, id)
+	})
+
+	plan, err := mountPlan(spec, dir)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debug("prepared container filesystem",
+		"source", plan.Source,
+		"rootfs", plan.Root,
+		"mounts", len(plan.Mounts),
+		"read_only", plan.ReadonlyRoot,
+	)
+
+	return &plan, nil
 }
 
 // start performs the re-exec handshake and supervises the container. It is
