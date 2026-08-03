@@ -58,7 +58,7 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 
-	for _, dispatch := range []func(string) (int, bool){stage1Helper, stage2Helper} {
+	for _, dispatch := range []func(string) (int, bool){stage1Helper, stage2Helper, stage3Helper} {
 		if code, handled := dispatch(mode); handled {
 			os.Exit(code)
 		}

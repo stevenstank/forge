@@ -77,7 +77,7 @@ complete list and rationale.
 ## Installation
 
 ```bash
-git clone https://github.com/<org>/forge.git
+git clone https://github.com/stevenstank/forge.git
 cd forge
 make build
 ```

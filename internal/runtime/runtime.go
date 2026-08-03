@@ -44,6 +44,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/stevenstank/forge/internal/cgroup"
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
 	"github.com/stevenstank/forge/internal/process"
@@ -64,6 +65,12 @@ type Config struct {
 	// Root is the directory per-container root filesystems are stored under,
 	// from the --root flag (SSOT §9).
 	Root string
+
+	// CgroupRoot is the mount point of the cgroup v2 unified hierarchy.
+	// Empty means cgroup.DefaultRoot, which is where every distribution
+	// mounts it; it exists so tests can point the runtime at a directory of
+	// their own.
+	CgroupRoot string
 }
 
 // Spec describes a container to run. It is the caller's complete statement of
@@ -99,6 +106,11 @@ type Spec struct {
 	// container. Empty means "/". Requires Rootfs.
 	WorkingDir string
 
+	// Limits are the container's resource limits. The zero value asks for
+	// none, which is what Stage 1 and Stage 2 containers get: the container
+	// still runs in a cgroup of its own, but nothing is capped.
+	Limits cgroup.Limits
+
 	// Stdin, Stdout and Stderr are wired to the container process.
 	Stdin  io.Reader
 	Stdout io.Writer
@@ -128,7 +140,14 @@ func (s Spec) Validate() error {
 		}
 	}
 
-	return s.validateFilesystem()
+	if err := s.validateFilesystem(); err != nil {
+		return err
+	}
+
+	// Checked here, in the parent, for the same reason as everything else in
+	// Validate: a limit the kernel would refuse should be a usage error, not a
+	// container that fails half-way through starting.
+	return s.Limits.Validate()
 }
 
 // validateFilesystem checks the Stage 2 half of the spec.
@@ -187,8 +206,9 @@ var (
 
 // Runner runs containers. Construct it with NewRunner.
 type Runner struct {
-	logger *slog.Logger
-	store  *rootfs.Store
+	logger  *slog.Logger
+	store   *rootfs.Store
+	cgroups *cgroup.Manager
 }
 
 // NewRunner returns a Runner that logs through logger and stores container root
@@ -196,12 +216,16 @@ type Runner struct {
 //
 // The logger is injected rather than global so every container operation can be
 // correlated by the container_id attribute this package attaches (SSOT §6).
+//
+// Constructing the cgroup manager touches nothing and cannot fail: whether the
+// host has a usable cgroup v2 hierarchy depends on what a container asks for,
+// so it is decided per container in prepareCgroup, which can report it.
 func NewRunner(logger *slog.Logger, cfg Config) (*Runner, error) {
 	store, err := rootfs.NewStore(cfg.Root, logger)
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{logger: logger, store: store}, nil
+	return &Runner{logger: logger, store: store, cgroups: cgroup.New(cfg.CgroupRoot)}, nil
 }
 
 // Run creates a container from spec, runs it to completion, and reports how it
@@ -248,6 +272,14 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
 
+	// The cgroup is created — and its limits written — before the container
+	// exists, so the limits are in force from the moment it joins rather than
+	// some time after it starts.
+	cgroupID, err := r.prepareCgroup(log, id, spec, cleanup)
+	if err != nil {
+		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
+	}
+
 	self, err := os.Executable()
 	if err != nil {
 		return process.Status{}, fmt.Errorf("locating the forge binary to re-execute: %w", err)
@@ -270,7 +302,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 		"clone_flags", fmt.Sprintf("%#x", nsCfg.CloneFlags()),
 	)
 
-	status, err := r.start(ctx, log, self, payload, nsCfg, spec)
+	status, err := r.start(ctx, log, self, payload, nsCfg, spec, cgroupID)
 	if err != nil {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
@@ -340,8 +372,10 @@ func (r *Runner) prepareFilesystem(
 }
 
 // start performs the re-exec handshake and supervises the container. It is
-// separated from Run so the resource-ordering — pipe, process, payload, wait —
-// reads top to bottom.
+// separated from Run so the resource-ordering — pipe, process, cgroup, payload,
+// wait — reads top to bottom.
+//
+// cgroupID is the container's cgroup, or empty for a container that has none.
 func (r *Runner) start(
 	ctx context.Context,
 	log *slog.Logger,
@@ -349,6 +383,7 @@ func (r *Runner) start(
 	payload []byte,
 	nsCfg namespace.Config,
 	spec Spec,
+	cgroupID string,
 ) (process.Status, error) {
 	payloadReader, payloadWriter, err := os.Pipe()
 	if err != nil {
@@ -386,15 +421,25 @@ func (r *Runner) start(
 
 	log.Info("container started", "pid", p.PID(), "state", p.State().String())
 
+	// The container joins its cgroup here, in the window the handshake opens.
+	//
+	// A cgroup can only be joined by writing a PID to cgroup.procs, so there is
+	// no way to be a member before clone(2) returns. What closes that window is
+	// what the child is doing right now: forge-init's first act is a blocking
+	// read on the payload pipe (ADR-0008), so it cannot mount, pivot, execve or
+	// fork until the parent writes below. Attaching first therefore guarantees
+	// every limit is in force before a single instruction of the container's
+	// own binary runs.
+	if cgroupID != "" {
+		if err := r.cgroups.Add(cgroupID, p.PID()); err != nil {
+			r.abandon(ctx, log, p, "a failed cgroup attach")
+			return process.Status{}, err
+		}
+		log.Debug("container joined its cgroup", "pid", p.PID(), "cgroup", cgroupID)
+	}
+
 	if err := writePayload(payloadWriter, payload); err != nil {
-		// The container is already running; reap it rather than leaking it
-		// (PRD NFR-8).
-		if killErr := p.Signal(syscall.SIGKILL); killErr != nil {
-			log.Warn("killing container after a failed handshake", "error", killErr)
-		}
-		if _, waitErr := p.Wait(ctx); waitErr != nil {
-			log.Warn("reaping container after a failed handshake", "error", waitErr)
-		}
+		r.abandon(ctx, log, p, "a failed handshake")
 		return process.Status{}, err
 	}
 
@@ -404,6 +449,22 @@ func (r *Runner) start(
 	}
 
 	return status, nil
+}
+
+// abandon kills and reaps a container that was started but cannot be allowed to
+// proceed, so a failure between clone(2) and the handshake leaves no orphan
+// (PRD NFR-8).
+//
+// It returns nothing: it runs on a path that already has an error to report,
+// and that error is the one the caller must see (SSOT §5). Failures here are
+// logged rather than discarded (SSOT §13.7).
+func (r *Runner) abandon(ctx context.Context, log *slog.Logger, p *process.Process, why string) {
+	if err := p.Signal(syscall.SIGKILL); err != nil {
+		log.Warn("killing container after "+why, "error", err)
+	}
+	if _, err := p.Wait(ctx); err != nil {
+		log.Warn("reaping container after "+why, "error", err)
+	}
 }
 
 // writePayload hands the init configuration to the child and closes the pipe,

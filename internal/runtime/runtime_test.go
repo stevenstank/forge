@@ -9,25 +9,51 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stevenstank/forge/internal/cgroup"
 	"github.com/stevenstank/forge/internal/logging"
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/rootfs"
 	"github.com/stevenstank/forge/internal/runtime"
 )
 
-// newRunner builds a Runner whose rootfs store lives in a temporary directory,
-// so a test can never write to the real /var/lib/forge.
+// newRunner builds a Runner whose rootfs store and cgroup hierarchy both live
+// in temporary directories, so a test can never write to the real
+// /var/lib/forge or the host's /sys/fs/cgroup.
 func newRunner(t *testing.T) *runtime.Runner {
 	t.Helper()
 
 	runner, err := runtime.NewRunner(
 		logging.New(io.Discard, slog.LevelError),
-		runtime.Config{Root: filepath.Join(t.TempDir(), "containers")},
+		runtime.Config{
+			Root:       filepath.Join(t.TempDir(), "containers"),
+			CgroupRoot: fakeCgroupRoot(t),
+		},
 	)
 	if err != nil {
 		t.Fatalf("NewRunner() = %v", err)
 	}
 	return runner
+}
+
+// fakeCgroupRoot builds a directory that looks enough like the root of a cgroup
+// v2 unified hierarchy for internal/cgroup to work in.
+//
+// cgroup v2 is a filesystem interface driven entirely through os and filepath,
+// so a temp directory exercises the real create/attach/destroy code against
+// real files without root. What it cannot do is enforce a limit — that is what
+// the Stage 3 integration tests are for.
+func fakeCgroupRoot(t *testing.T) string {
+	t.Helper()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu io memory pids"), 0o644); err != nil {
+		t.Fatalf("writing cgroup.controllers: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cgroup.subtree_control"), nil, 0o644); err != nil {
+		t.Fatalf("writing cgroup.subtree_control: %v", err)
+	}
+
+	return root
 }
 
 // TestNewRunnerRejectsARelativeRoot keeps a misconfigured --root from resolving
@@ -346,6 +372,260 @@ func TestRunLeavesNoContainerDirectoryWhenItFailsEarly(t *testing.T) {
 			names = append(names, e.Name())
 		}
 		t.Errorf("store root contains %v after a failed run, want it empty", names)
+	}
+}
+
+// --- Stage 3 --------------------------------------------------------------
+
+// The Stage 3 tests assert what the parent does around the container: that a
+// bad limit is refused before anything is forked, that a leaf is created for
+// every container, and that no leaf survives a run however that run ends.
+//
+// None of them needs root, and none of them asserts enforcement — whether the
+// kernel actually caps memory is a property of the kernel, not of this package,
+// and belongs to test/integration.
+
+// runToCompletion runs a spec and returns the error, if any. Without root the
+// clone(2) is refused and Run fails; as root the container really starts. Both
+// outcomes are useful to the tests below, which assert what is true either way:
+// what the cleanup left behind.
+func runToCompletion(t *testing.T, runner *runtime.Runner, spec runtime.Spec) error {
+	t.Helper()
+
+	_, err := runner.Run(t.Context(), spec)
+	return err
+}
+
+// forgeCgroupEntries lists what is left under Forge's own cgroup.
+func forgeCgroupEntries(t *testing.T, cgroupRoot string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(filepath.Join(cgroupRoot, "forge"))
+	if err != nil {
+		t.Fatalf("reading forge's cgroup: %v", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			names = append(names, entry.Name())
+		}
+	}
+
+	return names
+}
+
+func TestSpecValidateStage3(t *testing.T) {
+	t.Parallel()
+
+	memory := func(b cgroup.Bytes) *cgroup.Bytes { return &b }
+	weight := func(w cgroup.Weight) *cgroup.Weight { return &w }
+	procs := func(p int64) *int64 { return &p }
+
+	tests := []struct {
+		name    string
+		spec    runtime.Spec
+		wantErr error
+	}{
+		{
+			name: "no limits is valid: that is stage 1 and 2 behaviour",
+			spec: runtime.Spec{Command: []string{"/bin/echo", "hi"}},
+		},
+		{
+			name: "every limit at once is valid",
+			spec: runtime.Spec{
+				Command: []string{"/bin/sh"},
+				Limits: cgroup.Limits{
+					MemoryMax: memory(128 << 20),
+					CPU:       &cgroup.CPUQuota{Quota: 150_000},
+					CPUWeight: weight(512),
+					PIDsMax:   procs(64),
+				},
+			},
+		},
+		{
+			name: "limits need no rootfs: a stage 1 container can be limited too",
+			spec: runtime.Spec{
+				Command: []string{"/bin/echo", "hi"},
+				Limits:  cgroup.Limits{MemoryMax: memory(64 << 20)},
+			},
+		},
+		{
+			name: "a memory limit of zero is rejected",
+			spec: runtime.Spec{
+				Command: []string{"/bin/sh"},
+				Limits:  cgroup.Limits{MemoryMax: memory(0)},
+			},
+			wantErr: cgroup.ErrInvalidLimit,
+		},
+		{
+			name: "a cpu quota of zero is rejected",
+			spec: runtime.Spec{
+				Command: []string{"/bin/sh"},
+				Limits:  cgroup.Limits{CPU: &cgroup.CPUQuota{Quota: 0}},
+			},
+			wantErr: cgroup.ErrInvalidLimit,
+		},
+		{
+			name: "a cpu weight outside the kernel's range is rejected",
+			spec: runtime.Spec{
+				Command: []string{"/bin/sh"},
+				Limits:  cgroup.Limits{CPUWeight: weight(cgroup.MaxWeight + 1)},
+			},
+			wantErr: cgroup.ErrInvalidLimit,
+		},
+		{
+			name: "a pids limit of zero is rejected",
+			spec: runtime.Spec{
+				Command: []string{"/bin/sh"},
+				Limits:  cgroup.Limits{PIDsMax: procs(0)},
+			},
+			wantErr: cgroup.ErrInvalidLimit,
+		},
+		{
+			name: "the command is still validated",
+			spec: runtime.Spec{
+				Command: []string{"sh"},
+				Limits:  cgroup.Limits{MemoryMax: memory(64 << 20)},
+			},
+			wantErr: runtime.ErrNotAPath,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.spec.Validate()
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Validate() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRunRejectsInvalidLimitsBeforeForking keeps a limit the kernel would
+// refuse from becoming a container that fails half-way through starting.
+func TestRunRejectsInvalidLimitsBeforeForking(t *testing.T) {
+	t.Parallel()
+
+	cgroupRoot := fakeCgroupRoot(t)
+	runner, err := runtime.NewRunner(
+		logging.New(io.Discard, slog.LevelError),
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: cgroupRoot},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() = %v", err)
+	}
+
+	zero := cgroup.Bytes(0)
+	spec := runtime.Spec{Command: []string{"/bin/true"}, Limits: cgroup.Limits{MemoryMax: &zero}}
+
+	if err := runToCompletion(t, runner, spec); !errors.Is(err, cgroup.ErrInvalidLimit) {
+		t.Fatalf("Run() = %v, want %v", err, cgroup.ErrInvalidLimit)
+	}
+
+	// Refused before anything was created: not even Forge's own cgroup exists.
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "forge")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a rejected spec created %s", filepath.Join(cgroupRoot, "forge"))
+	}
+}
+
+// TestRunCreatesAndDestroysTheContainerCgroup covers FR-3.1 and FR-3.5 from the
+// orchestrator's side: a leaf is created for the container, and nothing
+// survives the run.
+//
+// It asserts the same postcondition whether the run succeeded or the clone was
+// refused for want of privileges, which is what makes it meaningful in both a
+// developer's shell and a privileged CI runner.
+func TestRunCreatesAndDestroysTheContainerCgroup(t *testing.T) {
+	t.Parallel()
+
+	cgroupRoot := fakeCgroupRoot(t)
+	runner, err := runtime.NewRunner(
+		logging.New(io.Discard, slog.LevelError),
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: cgroupRoot},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() = %v", err)
+	}
+
+	// Limit-free, so this exercises the success path: a fake hierarchy has none
+	// of the interface files the kernel creates with a leaf, so a container
+	// with limits could only fail here. What Forge writes into a real leaf is
+	// asserted by the Stage 3 integration tests.
+	spec := runtime.Spec{Command: []string{"/bin/true"}}
+
+	runErr := runToCompletion(t, runner, spec)
+
+	// Forge's own cgroup is created on demand and deliberately never removed:
+	// concurrent runs would race to remove a directory the other is about to
+	// create in. Its existence is also the evidence that the container's leaf
+	// was created at all.
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "forge")); err != nil {
+		t.Fatalf("expected forge's cgroup to exist after a run (run error: %v): %v", runErr, err)
+	}
+
+	if leaves := forgeCgroupEntries(t, cgroupRoot); len(leaves) != 0 {
+		t.Errorf("cgroups %v survived the run (run error: %v), want none", leaves, runErr)
+	}
+}
+
+// TestRunFailsWhenLimitsCannotBeApplied is the rule that a limit the caller
+// asked for is never silently dropped: a container that was meant to be capped
+// must not start uncapped.
+func TestRunFailsWhenLimitsCannotBeApplied(t *testing.T) {
+	t.Parallel()
+
+	// A directory with no cgroup.controllers is what a cgroup v1 or hybrid
+	// host looks like from here.
+	runner, err := runtime.NewRunner(
+		logging.New(io.Discard, slog.LevelError),
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: t.TempDir()},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() = %v", err)
+	}
+
+	memory := cgroup.Bytes(64 << 20)
+	spec := runtime.Spec{Command: []string{"/bin/true"}, Limits: cgroup.Limits{MemoryMax: &memory}}
+
+	if err := runToCompletion(t, runner, spec); !errors.Is(err, cgroup.ErrUnifiedHierarchyNotMounted) {
+		t.Fatalf("Run() = %v, want %v", err, cgroup.ErrUnifiedHierarchyNotMounted)
+	}
+}
+
+// TestRunWithoutLimitsToleratesAMissingHierarchy is the other half of that
+// rule. A container that asked for no limits loses only accounting, and
+// refusing to start it would regress Stages 1 and 2 on every cgroup v1 host.
+func TestRunWithoutLimitsToleratesAMissingHierarchy(t *testing.T) {
+	t.Parallel()
+
+	var logs strings.Builder
+	runner, err := runtime.NewRunner(
+		logging.New(&logs, slog.LevelWarn),
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: t.TempDir()},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() = %v", err)
+	}
+
+	// The run itself may still fail for want of privileges; what matters is
+	// that it was not the cgroup that stopped it.
+	err = runToCompletion(t, runner, runtime.Spec{Command: []string{"/bin/true"}})
+	if errors.Is(err, cgroup.ErrUnifiedHierarchyNotMounted) {
+		t.Fatalf("Run() = %v, want the missing hierarchy to be tolerated", err)
+	}
+
+	// Tolerated, but never silent (SSOT §13.7).
+	if !strings.Contains(logs.String(), "cgroup") {
+		t.Errorf("log %q does not warn that the container runs without a cgroup", logs.String())
 	}
 }
 
