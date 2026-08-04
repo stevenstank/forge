@@ -104,7 +104,7 @@ sudo ./bin/forge run /bin/echo "hello from forge"
 
 ## Example Commands
 
-> **Stage 2 is the current stage.** `forge run` takes a **path to a binary**,
+> **Stage 3 is the current stage.** `forge run` takes a **path to a binary**,
 > not an image reference — images arrive in Stage 5. Without `-rootfs` that path
 > is on the host and the container shares the host's filesystem, exactly as in
 > Stage 1. With `-rootfs` it is a path *inside* the container's own root
@@ -176,6 +176,57 @@ ls /var/lib/forge/containers                         # → empty
 > per-container copy-on-write arrives with image layering in Stage 5. Use
 > `-read-only` if that matters to you.
 
+### Stage 3 — resource limits
+
+Every container gets its own cgroup v2 leaf at `/sys/fs/cgroup/forge/<id>`, so
+it is accounted for whether or not you cap anything. Four flags turn accounting
+into enforcement. Flags may be written `-memory` or `--memory`; both are the
+same flag.
+
+```bash
+# Cap memory. The container lives in RAM or it is OOM-killed — swap is capped
+# alongside it, so a container cannot escape the limit by paging out.
+sudo forge run --memory 128m /bin/sh
+
+# Suffixes are 1024-based: 512m, 1g, 1gib and a bare byte count all work
+sudo forge run --memory 1g --rootfs /srv/alpine /bin/sh
+
+# An allocator that overruns its limit is killed, not slowed down
+sudo forge run --memory 32m /bin/sh -c 'a=; while :; do a="$a$a x"; done'
+echo $?                                              # → 137 (128 + SIGKILL)
+
+# Hard CPU ceiling, in cores. 0.5 is half a core, 1.5 is one and a half.
+sudo forge run --cpus 0.5 /bin/sh -c 'while :; do :; done'
+
+# A relative share instead of a ceiling: this container gets twice the CPU of a
+# sibling left at the default 100 — but only when both are competing, and
+# neither is capped.
+sudo forge run --cpu-weight 200 /bin/sh
+
+# The two are orthogonal: a ceiling and a share of what is left under it
+sudo forge run --cpus 1.5 --cpu-weight 512 /bin/sh
+
+# Cap the process count, which is what stops a fork bomb taking the host with it
+sudo forge run --pids 64 /bin/sh -c 'while :; do sleep 30 & done'
+                                                     # → fork fails, host survives
+
+# Combine them
+sudo forge run --rootfs /srv/alpine --memory 256m --cpus 1 --pids 128 /bin/sh
+
+# "max" asks for no limit explicitly, which is not the same as saying nothing:
+# an unset flag inherits, "max" writes an unlimited value.
+sudo forge run --memory max --pids max /bin/sh
+
+# The leaf is removed with the container, whatever the container exits with
+sudo forge run --memory 128m /bin/false
+ls /sys/fs/cgroup/forge                              # → empty
+```
+
+> **A limit you asked for is never silently dropped.** On a host without a
+> cgroup v2 unified hierarchy, a container with limits refuses to start rather
+> than starting uncapped; a container that asked for nothing still runs, losing
+> only accounting.
+
 Later stages will add:
 
 ```bash
@@ -198,7 +249,7 @@ its own right.
 |---|---|---|---|
 | 1 | Process Isolation | PID / UTS / mount namespaces | ✅ Complete |
 | 2 | Filesystem Isolation | `pivot_root`, bind mounts | ✅ Complete |
-| 3 | Resource Limits | cgroups v2 (memory, CPU, pids) | Not started |
+| 3 | Resource Limits | cgroups v2 (memory, CPU, pids) | ✅ Complete |
 | 4 | Networking | network namespaces, veth, bridge, NAT | Not started |
 | 5 | Images | OCI image pull, unpack, layer cache | Not started |
 | 6 | Runtime | `ps` / `exec` / `stop` / `logs`, full lifecycle | Not started |
