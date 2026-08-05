@@ -10,6 +10,7 @@ import (
 
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
+	"github.com/stevenstank/forge/internal/network"
 )
 
 // initPayloadFD is the descriptor the init payload arrives on. Go's exec
@@ -81,6 +82,16 @@ type initPayload struct {
 	// container. Empty means wherever the pivot left the process, which is
 	// the container's "/".
 	WorkingDir string `json:"working_dir,omitempty"`
+
+	// Network is the interface the container configures on itself, or nil for
+	// a container that has none. A container with Namespace.Net and no
+	// interface is one in network.ModeNone: it still gets loopback, which is
+	// all an isolated namespace has.
+	//
+	// It is a plain description rather than anything holding kernel state,
+	// because the child has no Manager, no bridge and no pool — only what
+	// arrived on the pipe (ADR-0018).
+	Network *network.Interface `json:"network,omitempty"`
 }
 
 // Init is the container's entry point, executed by the re-exec'd forge binary
@@ -94,6 +105,10 @@ type initPayload struct {
 //
 //	namespace.Apply    the mount tree is made private first, or every mount
 //	                   below it propagates to the host (FR-1.3)
+//	network.Configure  the interface the parent pushed in, brought up and
+//	                   routed while netlink is the only thing needed — before
+//	                   the pivot, so a failure is reported against a process
+//	                   that still has the host's filesystem to report it with
 //	mount.Apply        the container's mounts, made while the host filesystem
 //	                   is still reachable — bind sources are host paths, and
 //	                   after the pivot there is no host left to bind from
@@ -112,6 +127,10 @@ func Init() error {
 	}
 
 	if err := namespace.Apply(payload.Namespace); err != nil {
+		return err
+	}
+
+	if err := configureNetwork(payload); err != nil {
 		return err
 	}
 
@@ -134,6 +153,29 @@ func Init() error {
 
 	// Unreachable: a successful execve never returns.
 	return errors.New("execve returned without an error")
+}
+
+// configureNetwork applies the container's own half of Stage 4 (FR-4.1,
+// FR-4.3).
+//
+// The parent moved the interface into this namespace; everything after that is
+// done here, by the process that is already inside it, rather than by a parent
+// entering it with setns(2) (ADR-0018).
+//
+// The three cases are the three modes, and the middle one is the one that is
+// easy to forget: a container with a namespace and no interface still cannot
+// reach 127.0.0.1 until something brings loopback up.
+func configureNetwork(payload initPayload) error {
+	switch {
+	case payload.Network != nil:
+		return network.Configure(*payload.Network)
+	case payload.Namespace.Net:
+		return network.ConfigureLoopback()
+	default:
+		// Host networking: this process is in the host's network namespace and
+		// must configure nothing at all.
+		return nil
+	}
 }
 
 // enterWorkingDir moves the container's init into its working directory.
@@ -202,6 +244,20 @@ func decodeInitPayload(r io.Reader) (initPayload, error) {
 	// destination that escapes the container root must never reach mount(2).
 	if payload.Mount != nil {
 		if err := payload.Mount.Validate(); err != nil {
+			return initPayload{}, err
+		}
+	}
+
+	// Re-validated here for the same reason as the mount plan, and with more at
+	// stake: this process would apply the interface to whatever network
+	// namespace it is in. Without CLONE_NEWNET that is the host's, so an
+	// address, a rename and a default route would land on the machine rather
+	// than on the container.
+	if payload.Network != nil {
+		if !payload.Namespace.Net {
+			return initPayload{}, ErrNetworkWithoutNetns
+		}
+		if err := payload.Network.Validate(); err != nil {
 			return initPayload{}, err
 		}
 	}

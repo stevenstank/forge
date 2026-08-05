@@ -11,6 +11,7 @@ import (
 
 	"github.com/stevenstank/forge/internal/cgroup"
 	"github.com/stevenstank/forge/internal/mount"
+	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/rootfs"
 	"github.com/stevenstank/forge/internal/runtime"
 )
@@ -46,6 +47,9 @@ type runFlags struct {
 	cpus      string
 	cpuWeight string
 	pids      string
+
+	network string
+	mtu     int
 }
 
 // mountList collects repeated -mount flags. Parsing each one immediately means
@@ -98,6 +102,14 @@ func newRunFlagSet() (*flag.FlagSet, *runFlags) {
 	fs.StringVar(&local.cpus, "cpus", "", "CPU limit in cores, such as `1.5` or max (default: unlimited)")
 	fs.StringVar(&local.cpuWeight, "cpu-weight", "", "relative CPU share from 1 to 10000, such as `512` (default: the kernel's 100)")
 	fs.StringVar(&local.pids, "pids", "", "maximum number of processes, such as `64` or max (default: unlimited)")
+
+	// Networking (FR-4.1 to FR-4.4). Empty is passed straight through for the
+	// same reason the limits are: which network a container gets when nobody
+	// asks is the runtime's decision, not the CLI's (SSOT §2). The runtime's
+	// answer is bridge, which the usage text below states so it is not a
+	// secret kept in a struct tag.
+	fs.StringVar(&local.network, "network", "", "network `mode`: bridge, none or host (default: bridge)")
+	fs.IntVar(&local.mtu, "mtu", 0, "MTU of the container's interface (default: the kernel's)")
 
 	return fs, &local
 }
@@ -180,6 +192,8 @@ func parseRunSpec(args []string) (runtime.Spec, error) {
 		ReadonlyRoot: local.readOnly,
 		WorkingDir:   local.workdir,
 		Limits:       limits,
+		Network:      network.Mode(local.network),
+		NetworkMTU:   local.mtu,
 	}
 	if err := spec.Validate(); err != nil {
 		return runtime.Spec{}, err
@@ -257,6 +271,12 @@ func isUserError(err error) bool {
 		runtime.ErrRootfsNotAbsolute,
 		runtime.ErrWorkingDirNotAbsolute,
 		runtime.ErrMountWithoutRootfs,
+		runtime.ErrMTUWithoutInterface,
+		runtime.ErrInvalidMTU,
+		// A mode that is not one of the three, or an MTU the kernel refuses.
+		// The environment sentinels next door stay absent for the reason given
+		// above: a host with no nf_tables or no CAP_NET_ADMIN is not a typo.
+		network.ErrInvalidInterface,
 		rootfs.ErrSourceNotFound,
 		rootfs.ErrSourceNotADirectory,
 		rootfs.ErrSourceIsHostRoot,
@@ -289,6 +309,10 @@ func writeRunUsage(w io.Writer) {
 	fmt.Fprint(w, "Every container gets a cgroup v2 leaf for accounting. -memory, -cpus,\n")
 	fmt.Fprint(w, "-cpu-weight and -pids constrain it; a limit left unset is inherited rather\n")
 	fmt.Fprint(w, "than capped. Pass \"max\" to ask for no limit explicitly.\n\n")
+	fmt.Fprint(w, "By default the container gets its own network namespace, an address on the\n")
+	fmt.Fprint(w, "forge0 bridge, and NAT to the outside world. -network none gives it an\n")
+	fmt.Fprint(w, "isolated namespace with only loopback; -network host leaves it in the host's\n")
+	fmt.Fprint(w, "network namespace with no isolation at all.\n\n")
 	fmt.Fprint(w, "Flags:\n")
 
 	fs, _ := newRunFlagSet()
@@ -301,6 +325,7 @@ func writeRunUsage(w io.Writer) {
 	fmt.Fprint(w, "  sudo forge run -rootfs /srv/alpine -mount /srv/data:/data:ro /bin/ls /data\n")
 	fmt.Fprint(w, "  sudo forge run -memory 128m -pids 64 /bin/sh\n")
 	fmt.Fprint(w, "  sudo forge run -cpus 1.5 -cpu-weight 512 /bin/sh\n")
+	fmt.Fprint(w, "  sudo forge run -network none /bin/sh\n")
 }
 
 // newInitCommand builds Forge's internal re-exec entry point.

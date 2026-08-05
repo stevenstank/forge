@@ -12,6 +12,7 @@ import (
 	"github.com/stevenstank/forge/internal/cgroup"
 	"github.com/stevenstank/forge/internal/logging"
 	"github.com/stevenstank/forge/internal/mount"
+	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/rootfs"
 	"github.com/stevenstank/forge/internal/runtime"
 )
@@ -632,3 +633,116 @@ func TestRunWithoutLimitsToleratesAMissingHierarchy(t *testing.T) {
 // Init itself is exercised end to end by the Stage 1 integration tests; its
 // wire format is covered by the decodeInitPayload tests in init_internal_test.go.
 // Calling Init here would read whatever the test harness left on descriptor 3.
+
+// --- Stage 4 --------------------------------------------------------------
+
+// TestSpecValidateStage4 covers the networking half of the spec. Like
+// everything else in Validate it is pure: a mode that does not exist, or an MTU
+// the kernel would refuse, must be rejected in the parent rather than half-way
+// through starting a container.
+func TestSpecValidateStage4(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		spec    runtime.Spec
+		wantErr error
+	}{
+		{
+			name: "no mode is valid and means bridge",
+			spec: runtime.Spec{Command: []string{"/bin/sh"}},
+		},
+		{
+			name: "each mode forge implements",
+			spec: runtime.Spec{Command: []string{"/bin/sh"}, Network: network.ModeNone},
+		},
+		{
+			name: "host mode, which is stages 1 to 3",
+			spec: runtime.Spec{Command: []string{"/bin/sh"}, Network: network.ModeHost},
+		},
+		{
+			name:    "a mode forge does not implement",
+			spec:    runtime.Spec{Command: []string{"/bin/sh"}, Network: network.Mode("macvlan")},
+			wantErr: network.ErrInvalidInterface,
+		},
+		{
+			name:    "a mode that is merely misspelled",
+			spec:    runtime.Spec{Command: []string{"/bin/sh"}, Network: network.Mode("Bridge")},
+			wantErr: network.ErrInvalidInterface,
+		},
+		{
+			name: "an mtu on a bridged container",
+			spec: runtime.Spec{Command: []string{"/bin/sh"}, NetworkMTU: 1400},
+		},
+		{
+			name:    "an mtu with no interface to put it on",
+			spec:    runtime.Spec{Command: []string{"/bin/sh"}, Network: network.ModeHost, NetworkMTU: 1400},
+			wantErr: runtime.ErrMTUWithoutInterface,
+		},
+		{
+			name:    "an mtu with only loopback to put it on",
+			spec:    runtime.Spec{Command: []string{"/bin/sh"}, Network: network.ModeNone, NetworkMTU: 1400},
+			wantErr: runtime.ErrMTUWithoutInterface,
+		},
+		{
+			name:    "an mtu below what a veth accepts",
+			spec:    runtime.Spec{Command: []string{"/bin/sh"}, NetworkMTU: 67},
+			wantErr: runtime.ErrInvalidMTU,
+		},
+		{
+			name:    "an mtu above what a veth accepts",
+			spec:    runtime.Spec{Command: []string{"/bin/sh"}, NetworkMTU: 65536},
+			wantErr: runtime.ErrInvalidMTU,
+		},
+		{
+			name:    "a negative mtu",
+			spec:    runtime.Spec{Command: []string{"/bin/sh"}, NetworkMTU: -1},
+			wantErr: runtime.ErrInvalidMTU,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.spec.Validate()
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Validate() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRunRejectsAnUnknownNetworkModeBeforeForking confirms the mode is checked
+// where every other spec field is: in the parent, before a namespace exists.
+func TestRunRejectsAnUnknownNetworkModeBeforeForking(t *testing.T) {
+	t.Parallel()
+
+	runner := newRunner(t)
+
+	spec := runtime.Spec{Command: []string{"/bin/echo", "hi"}, Network: network.Mode("macvlan")}
+	if _, err := runner.Run(t.Context(), spec); !errors.Is(err, network.ErrInvalidInterface) {
+		t.Fatalf("Run() = %v, want %v", err, network.ErrInvalidInterface)
+	}
+}
+
+// TestNewRunnerRejectsAnUnusableSubnet is the network half of what
+// TestNewRunnerRejectsARelativeRoot does for storage: a configuration that is
+// wrong on its face fails at construction, not at the first container.
+func TestNewRunnerRejectsAnUnusableSubnet(t *testing.T) {
+	t.Parallel()
+
+	_, err := runtime.NewRunner(logging.New(io.Discard, slog.LevelError), runtime.Config{
+		Root:    t.TempDir(),
+		Network: network.Config{Subnet: "10.99.0.0/31"},
+	})
+	if !errors.Is(err, network.ErrInvalidSubnet) {
+		t.Fatalf("NewRunner() = %v, want %v", err, network.ErrInvalidSubnet)
+	}
+}

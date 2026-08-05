@@ -2,9 +2,40 @@
 // lifecycle.
 //
 // Per SSOT §13.2 it is the only orchestrator: the primitive packages never call
-// one another, and every cross-package sequencing decision lives here. Stage 2
-// composes four primitives — internal/namespace, internal/process,
-// internal/rootfs and internal/mount.
+// one another, and every cross-package sequencing decision lives here. As of
+// Stage 4 it composes six — internal/namespace, internal/process,
+// internal/rootfs, internal/mount, internal/cgroup and internal/network.
+//
+// # The lifecycle
+//
+// Every container follows the same ten steps, and the order of the first eight
+// is forced rather than chosen. Each column says what makes the step impossible
+// any earlier.
+//
+//	 1  prepare filesystem   parent    the container directory and mount plan
+//	 2  prepare cgroup       parent    limits written before anything can join
+//	 3  prepare network      parent    bridge, NAT and an address; no container
+//	                                   needed, so it is claimed before there is
+//	                                   one to leak it
+//	 -- clone(2) ------------------------------------------------------------
+//	 4  start process        parent    the namespaces exist; the child blocks
+//	                                   on the payload pipe and does nothing
+//	 5  attach pid           parent    cgroup.procs needs a pid, and a pid needs
+//	                                   clone(2) to have returned
+//	 6  move interface       parent    a netns can only be named by the pid of
+//	                                   a process already inside it
+//	 7  configure host side  parent    the host veth is enslaved to the bridge
+//	                                   and brought up
+//	 8  send payload         parent    releases the child, which configures its
+//	                                   own interface, mounts, pivots and execs
+//	 9  wait                 parent    supervise until the container exits
+//	10  cleanup              parent    unwind the stack, in reverse
+//
+// Steps 5 to 7 all happen inside the window step 4 opens: the child's first act
+// is a blocking read (ADR-0008), so it cannot run a single instruction of the
+// container's own binary until step 8. Everything a container must be born with
+// — its limits, its interface — is therefore in place before it, rather than
+// racing it.
 //
 // # How a container starts
 //
@@ -14,15 +45,39 @@
 // (FR-1.3), and building the container's root filesystem (FR-2.1, FR-2.2).
 // Forge therefore starts itself rather than the container's binary:
 //
-//	forge run          →  clone(CLONE_NEWPID|NEWUTS|NEWNS)
+//	forge run          →  clone(CLONE_NEWPID|NEWUTS|NEWNS|NEWNET)
 //	                        →  /proc/self/exe __init      (this package, Init)
 //	                             →  namespace.Apply
+//	                             →  network.Configure     (its own interface)
 //	                             →  mount.Apply           (the container's mounts)
 //	                             →  mount.PivotRoot       (its root filesystem)
 //	                             →  execve(user binary)
 //
 // The configuration crosses that boundary as JSON on an inherited pipe. See
-// ADR-0008.
+// ADR-0008. Stage 4 adds one more thing to that list — network.Configure,
+// which runs between namespace.Apply and the mounts, because an interface is
+// configured over netlink and needs no filesystem at all (ADR-0018).
+//
+// # Cleanup
+//
+// One rule, applied without exception: a cleanup is registered on the stack the
+// moment the resource it releases exists, and never later. Registration order
+// is therefore acquisition order, and the stack unwinds in reverse (SSOT §11.3):
+//
+//	release network   →   release cgroup   →   remove filesystem
+//
+// The reversal is load-bearing rather than tidy. The network is released first
+// because the container may still be holding an interface plugged into the
+// bridge; the cgroup next, because a cgroup cannot be removed while a process
+// is in it; the filesystem last, because it is the thing a still-running
+// container has open.
+//
+// Registering *before* the next thing can fail is what makes partial failure
+// safe. Every intermediate state a run can die in — an address claimed but no
+// veth made, a veth made but never moved, a container attached but never told
+// what to do — unwinds through a Destroy that already knows about it, and every
+// Destroy is idempotent (SSOT §13.3). Nothing releases what it did not create,
+// and nothing is created that something is not already prepared to release.
 //
 // # What the parent does
 //
@@ -47,6 +102,7 @@ import (
 	"github.com/stevenstank/forge/internal/cgroup"
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
+	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/process"
 	"github.com/stevenstank/forge/internal/rootfs"
 )
@@ -71,6 +127,16 @@ type Config struct {
 	// mounts it; it exists so tests can point the runtime at a directory of
 	// their own.
 	CgroupRoot string
+
+	// Network is the host side of container networking: the bridge every
+	// container is plugged into, the subnet their addresses come from, and
+	// where their IP leases are recorded. The zero value takes
+	// internal/network's defaults, which is the production configuration.
+	//
+	// It is a struct rather than three flattened fields because it is passed
+	// through verbatim: the runtime decides *whether* a container is
+	// networked, never what the host's bridge is called.
+	Network network.Config
 }
 
 // Spec describes a container to run. It is the caller's complete statement of
@@ -111,6 +177,22 @@ type Spec struct {
 	// still runs in a cgroup of its own, but nothing is capped.
 	Limits cgroup.Limits
 
+	// Network is how the container is attached to the network. Empty means
+	// network.ModeBridge, so a container that asks for nothing gets the
+	// isolated, connected network FR-4.1 requires — what a container gets
+	// when nobody asks is the runtime's decision, not the caller's (SSOT §2).
+	//
+	// network.ModeHost is the escape hatch back to Stages 1 to 3: the
+	// container shares the host's network namespace and Forge creates
+	// nothing.
+	Network network.Mode
+
+	// NetworkMTU is the MTU of the container's interface. Zero leaves the
+	// kernel's default, which is what almost every container wants; it is
+	// here for hosts whose uplink is itself tunnelled. Requires a mode with
+	// an interface to apply it to.
+	NetworkMTU int
+
 	// Stdin, Stdout and Stderr are wired to the container process.
 	Stdin  io.Reader
 	Stdout io.Writer
@@ -141,6 +223,10 @@ func (s Spec) Validate() error {
 	}
 
 	if err := s.validateFilesystem(); err != nil {
+		return err
+	}
+
+	if err := s.validateNetwork(); err != nil {
 		return err
 	}
 
@@ -184,6 +270,53 @@ func (s Spec) validateFilesystem() error {
 	}.Validate()
 }
 
+// NetworkMode returns the mode the spec asks for, with the empty value
+// resolved to the default.
+//
+// It is exported because "empty means bridge" is a decision callers have to be
+// able to see: a CLI that prints what it is about to do, or a test that asserts
+// the default, would otherwise have to hard-code the same rule.
+func (s Spec) NetworkMode() network.Mode {
+	if s.Network == "" {
+		return network.ModeBridge
+	}
+	return s.Network
+}
+
+// MTU bounds, from the kernel's veth driver (min_mtu and max_mtu in
+// drivers/net/veth.c). They are checked here so a value the kernel would refuse
+// is a usage error rather than a container that fails part-way through starting.
+const (
+	minMTU = 68
+	maxMTU = 65535
+)
+
+// validateNetwork checks the Stage 4 half of the spec.
+func (s Spec) validateNetwork() error {
+	mode := s.NetworkMode()
+	if err := mode.Validate(); err != nil {
+		return err
+	}
+
+	if s.NetworkMTU == 0 {
+		return nil
+	}
+
+	// An MTU with no interface to apply it to would be accepted and then
+	// silently ignored, which is the failure mode validateFilesystem exists to
+	// prevent for --mount and --workdir.
+	if !mode.NeedsVeth() {
+		return fmt.Errorf("%w: -mtu needs an interface to apply to, which %q networking does not create",
+			ErrMTUWithoutInterface, string(mode))
+	}
+	if s.NetworkMTU < minMTU || s.NetworkMTU > maxMTU {
+		return fmt.Errorf("%w: %d is outside the %d to %d a veth accepts",
+			ErrInvalidMTU, s.NetworkMTU, minMTU, maxMTU)
+	}
+
+	return nil
+}
+
 // Sentinel errors callers may branch on.
 var (
 	// ErrNoCommand reports a Spec with nothing to execute.
@@ -202,13 +335,26 @@ var (
 	// ErrMountWithoutRootfs reports a filesystem option given to a container
 	// that has no root filesystem of its own.
 	ErrMountWithoutRootfs = errors.New("option requires a root filesystem")
+
+	// ErrMTUWithoutInterface reports an MTU given to a container whose network
+	// mode creates no interface to put it on.
+	ErrMTUWithoutInterface = errors.New("option requires bridge networking")
+
+	// ErrInvalidMTU reports an MTU the kernel would refuse.
+	ErrInvalidMTU = errors.New("invalid MTU")
+
+	// ErrNetworkWithoutNetns reports an init payload carrying an interface for
+	// a container that has no network namespace to configure. Applying it
+	// would reconfigure the host.
+	ErrNetworkWithoutNetns = errors.New("an interface was given to a container with no network namespace")
 )
 
 // Runner runs containers. Construct it with NewRunner.
 type Runner struct {
-	logger  *slog.Logger
-	store   *rootfs.Store
-	cgroups *cgroup.Manager
+	logger   *slog.Logger
+	store    *rootfs.Store
+	cgroups  *cgroup.Manager
+	networks *network.Manager
 }
 
 // NewRunner returns a Runner that logs through logger and stores container root
@@ -217,15 +363,29 @@ type Runner struct {
 // The logger is injected rather than global so every container operation can be
 // correlated by the container_id attribute this package attaches (SSOT §6).
 //
-// Constructing the cgroup manager touches nothing and cannot fail: whether the
-// host has a usable cgroup v2 hierarchy depends on what a container asks for,
-// so it is decided per container in prepareCgroup, which can report it.
+// Constructing the cgroup and network managers touches nothing: whether the
+// host has a usable cgroup v2 hierarchy or a usable bridge depends on what a
+// container asks for, so both are decided per container — in prepareCgroup and
+// prepareNetwork — where they can be reported against that container. The only
+// thing that can fail here is a network configuration that is wrong on its
+// face, such as an unparseable subnet.
 func NewRunner(logger *slog.Logger, cfg Config) (*Runner, error) {
 	store, err := rootfs.NewStore(cfg.Root, logger)
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{logger: logger, store: store, cgroups: cgroup.New(cfg.CgroupRoot)}, nil
+
+	networks, err := network.New(logger, cfg.Network)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Runner{
+		logger:   logger,
+		store:    store,
+		cgroups:  cgroup.New(cfg.CgroupRoot),
+		networks: networks,
+	}, nil
 }
 
 // Run creates a container from spec, runs it to completion, and reports how it
@@ -257,16 +417,6 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	cleanup := newCleanupStack(log)
 	defer cleanup.unwind()
 
-	nsCfg := namespace.Config{
-		PID:      true,
-		UTS:      true,
-		Mount:    true,
-		Hostname: spec.Hostname,
-	}
-	if nsCfg.Hostname == "" {
-		nsCfg.Hostname = id
-	}
-
 	plan, err := r.prepareFilesystem(ctx, log, id, spec, cleanup)
 	if err != nil {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
@@ -280,6 +430,29 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
 
+	// Like the cgroup, the address is reserved before the container exists.
+	// The half that needs a namespace to exist — the veth pair — happens in
+	// start, once there is a PID to name it by.
+	cnet, err := r.prepareNetwork(log, id, spec, cleanup)
+	if err != nil {
+		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
+	}
+
+	// The namespaces are described last because one of them is the network's
+	// to decide: CLONE_NEWNET is what host mode opts out of, and prepareNetwork
+	// is where that is resolved. Nothing has been cloned yet — this is a
+	// description, and it is not acted on until start.
+	nsCfg := namespace.Config{
+		PID:      true,
+		UTS:      true,
+		Mount:    true,
+		Net:      cnet.mode.NeedsNetns(),
+		Hostname: spec.Hostname,
+	}
+	if nsCfg.Hostname == "" {
+		nsCfg.Hostname = id
+	}
+
 	self, err := os.Executable()
 	if err != nil {
 		return process.Status{}, fmt.Errorf("locating the forge binary to re-execute: %w", err)
@@ -291,6 +464,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 		Env:        spec.Env,
 		Mount:      plan,
 		WorkingDir: spec.WorkingDir,
+		Network:    cnet.iface(),
 	})
 	if err != nil {
 		return process.Status{}, fmt.Errorf("encoding init payload: %w", err)
@@ -299,10 +473,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	log.Debug("creating container",
 		"command", spec.Command,
 		"hostname", nsCfg.Hostname,
+		"network", string(cnet.mode),
 		"clone_flags", fmt.Sprintf("%#x", nsCfg.CloneFlags()),
 	)
 
-	status, err := r.start(ctx, log, self, payload, nsCfg, spec, cgroupID)
+	status, err := r.start(ctx, log, self, payload, nsCfg, spec, cgroupID, cnet)
 	if err != nil {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
@@ -372,8 +547,14 @@ func (r *Runner) prepareFilesystem(
 }
 
 // start performs the re-exec handshake and supervises the container. It is
-// separated from Run so the resource-ordering — pipe, process, cgroup, payload,
-// wait — reads top to bottom.
+// separated from Run so the resource-ordering — pipe, process, cgroup, network,
+// payload, wait — reads top to bottom.
+//
+// Everything between clone(2) and the payload write happens while the child is
+// blocked on its first read (ADR-0008). That window is the only place a
+// container can be joined to a cgroup or handed an interface, because both need
+// a PID that does not exist until clone returns and both must be in place
+// before the container's own binary runs.
 //
 // cgroupID is the container's cgroup, or empty for a container that has none.
 func (r *Runner) start(
@@ -384,6 +565,7 @@ func (r *Runner) start(
 	nsCfg namespace.Config,
 	spec Spec,
 	cgroupID string,
+	cnet containerNetwork,
 ) (process.Status, error) {
 	payloadReader, payloadWriter, err := os.Pipe()
 	if err != nil {
@@ -436,6 +618,20 @@ func (r *Runner) start(
 			return process.Status{}, err
 		}
 		log.Debug("container joined its cgroup", "pid", p.PID(), "cgroup", cgroupID)
+	}
+
+	// The interface is pushed across the namespace boundary in the same
+	// window, and for the same reason: a namespace can only be named by the
+	// PID of a process already inside it. The container configures what it
+	// finds there from the payload written below, so by the time its own
+	// binary runs the interface is present, addressed and routed.
+	//
+	// Nothing is rolled back here. A partial attach is released by the Destroy
+	// that prepareNetwork already registered, which is idempotent and covers
+	// every intermediate state this can fail in (SSOT §11.3, §13.3).
+	if err := r.attachNetwork(log, cnet, p.PID()); err != nil {
+		r.abandon(ctx, log, p, "a failed network attach")
+		return process.Status{}, err
 	}
 
 	if err := writePayload(payloadWriter, payload); err != nil {

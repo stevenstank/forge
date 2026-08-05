@@ -38,9 +38,19 @@ func TestConfigCloneFlags(t *testing.T) {
 			want: syscall.CLONE_NEWNS,
 		},
 		{
+			name: "net only",
+			cfg:  namespace.Config{Net: true},
+			want: syscall.CLONE_NEWNET,
+		},
+		{
 			name: "stage 1 combination",
 			cfg:  namespace.Config{PID: true, UTS: true, Mount: true},
 			want: syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWNS,
+		},
+		{
+			name: "stage 4 combination",
+			cfg:  namespace.Config{PID: true, UTS: true, Mount: true, Net: true},
+			want: syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET,
 		},
 		{
 			name: "hostname does not affect flags",

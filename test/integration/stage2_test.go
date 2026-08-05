@@ -21,6 +21,7 @@ import (
 
 	"github.com/stevenstank/forge/internal/logging"
 	"github.com/stevenstank/forge/internal/mount"
+	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/process"
 	"github.com/stevenstank/forge/internal/rootfs"
 	"github.com/stevenstank/forge/internal/runtime"
@@ -209,6 +210,9 @@ func (s *sandbox) spec(mode string, env ...string) runtime.Spec {
 		Rootfs:  s.source,
 		Mounts:  slices.Clone(s.libraries),
 		Env:     append([]string{helperEnv + "=" + mode}, env...),
+		// Host networking, for the reason given on helperSpec: this is a
+		// Stage 2 test and asserts nothing about Stage 4.
+		Network: network.ModeHost,
 	}
 }
 

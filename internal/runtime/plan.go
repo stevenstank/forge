@@ -46,9 +46,13 @@ func defaultMounts() []mount.Mount {
 			Data:        "mode=1777,size=65536k",
 		},
 		{
-			// Read-only until Stage 4 gives the container a network namespace
-			// of its own. A writable /sys in the host's network namespace is a
-			// hole in the *host's* configuration, not the container's.
+			// Read-only, and it stays that way now Stage 4 has arrived. A
+			// private network namespace does make /sys/class/net the
+			// container's own, but the rest of sysfs — /sys/kernel,
+			// /sys/module, /sys/firmware — is host-global whatever namespaces
+			// the container holds, so a writable /sys is a hole in the
+			// *host's* configuration rather than the container's. Docker
+			// reaches the same conclusion for the same reason.
 			Destination: "/sys",
 			Type:        mount.TypeSysfs,
 			Options: []mount.Option{

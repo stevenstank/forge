@@ -57,6 +57,15 @@ type Config struct {
 	// container are invisible to the host.
 	Mount bool
 
+	// Net requests a private network namespace, so the container has its own
+	// interfaces, routes and firewall rules, and starts with nothing but a
+	// down loopback.
+	//
+	// What is put *into* that namespace — a veth pair, an address, a default
+	// route — is internal/network's business. This only asks the kernel for
+	// the namespace, because this is where clone flags are computed.
+	Net bool
+
 	// Hostname is the name Apply assigns inside the UTS namespace. Empty
 	// means "leave whatever was inherited". Setting it requires UTS.
 	Hostname string
@@ -76,6 +85,9 @@ func (c Config) CloneFlags() uintptr {
 	}
 	if c.Mount {
 		flags |= syscall.CLONE_NEWNS
+	}
+	if c.Net {
+		flags |= syscall.CLONE_NEWNET
 	}
 	return flags
 }

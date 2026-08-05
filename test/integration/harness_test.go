@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/stevenstank/forge/internal/logging"
+	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/process"
 	"github.com/stevenstank/forge/internal/runtime"
 )
@@ -58,7 +59,7 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 
-	for _, dispatch := range []func(string) (int, bool){stage1Helper, stage2Helper, stage3Helper} {
+	for _, dispatch := range []func(string) (int, bool){stage1Helper, stage2Helper, stage3Helper, stage4Helper} {
 		if code, handled := dispatch(mode); handled {
 			os.Exit(code)
 		}
@@ -122,6 +123,13 @@ func runContainerIn(ctx context.Context, t *testing.T, root string, spec runtime
 // helperSpec returns a Spec that runs this test binary in the given mode,
 // directly from the host filesystem. Stage 2's rootfs-based equivalent is
 // rootfsSpec.
+//
+// Networking is pinned to host mode rather than left at the default. These are
+// the Stage 1 to 3 tests: they predate Stage 4, they assert nothing about
+// networking, and pinning the mode keeps them running on a host with no bridge
+// and no CAP_NET_ADMIN — and keeps them from writing an IP lease per container
+// into Forge's real state directory. Stage 4's own tests ask for a network
+// explicitly.
 func helperSpec(t *testing.T, mode string, env ...string) runtime.Spec {
 	t.Helper()
 
@@ -133,6 +141,7 @@ func helperSpec(t *testing.T, mode string, env ...string) runtime.Spec {
 	return runtime.Spec{
 		Command: []string{exe},
 		Env:     append([]string{helperEnv + "=" + mode}, env...),
+		Network: network.ModeHost,
 	}
 }
 

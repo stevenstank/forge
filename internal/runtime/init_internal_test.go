@@ -9,6 +9,7 @@ import (
 
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
+	"github.com/stevenstank/forge/internal/network"
 )
 
 // The init payload crosses a process boundary, so its encoding is a contract
@@ -274,5 +275,113 @@ func TestDecodeInitPayloadRejectsAnInvalidPlan(t *testing.T) {
 				t.Fatalf("decodeInitPayload(%s) = nil, want an error", tt.input)
 			}
 		})
+	}
+}
+
+// --- Stage 4 --------------------------------------------------------------
+
+// TestDecodeInitPayloadCarriesTheInterface confirms the description survives
+// the boundary intact. It is the only thing the container is told about its
+// network, so a field lost here is a container that configures itself wrongly
+// with no way to know it (ADR-0018).
+func TestDecodeInitPayloadCarriesTheInterface(t *testing.T) {
+	t.Parallel()
+
+	want := network.Interface{
+		Source:  "fcabc123def45",
+		Name:    "eth0",
+		Address: "10.99.0.7/16",
+		Gateway: "10.99.0.1",
+		MTU:     1400,
+	}
+
+	encoded, err := json.Marshal(initPayload{
+		Namespace: namespace.Config{PID: true, UTS: true, Mount: true, Net: true},
+		Command:   []string{"/bin/sh"},
+		Network:   &want,
+	})
+	if err != nil {
+		t.Fatalf("marshalling the payload: %v", err)
+	}
+
+	got, err := decodeInitPayload(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatalf("decodeInitPayload() = %v", err)
+	}
+	if got.Network == nil {
+		t.Fatal("Network = nil, want the interface the parent sent")
+	}
+	if *got.Network != want {
+		t.Errorf("Network = %+v, want %+v", *got.Network, want)
+	}
+}
+
+// TestDecodeInitPayloadRejectsAnInterfaceWithoutANetns is the guard that
+// matters most in this package. The init applies the interface to whatever
+// network namespace it is in; without CLONE_NEWNET that is the host's, so a
+// payload pairing an interface with no netns would rename a host interface,
+// give it a container's address, and install a default route on the machine.
+func TestDecodeInitPayloadRejectsAnInterfaceWithoutANetns(t *testing.T) {
+	t.Parallel()
+
+	input := `{"namespace":{"PID":true},"command":["/bin/sh"],` +
+		`"network":{"source":"fcabc123def45","name":"eth0","address":"10.99.0.7/16","gateway":"10.99.0.1"}}`
+
+	_, err := decodeInitPayload(strings.NewReader(input))
+	if !errors.Is(err, ErrNetworkWithoutNetns) {
+		t.Fatalf("decodeInitPayload() = %v, want %v", err, ErrNetworkWithoutNetns)
+	}
+}
+
+// TestDecodeInitPayloadRejectsAnInvalidInterface re-checks in the child what
+// the parent already checked, for the same reason the mount plan is re-checked:
+// this is the process that would act on it.
+func TestDecodeInitPayloadRejectsAnInvalidInterface(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "no address",
+			input: `{"namespace":{"Net":true},"command":["/bin/sh"],"network":{"source":"fcabc","name":"eth0"}}`,
+		},
+		{
+			name:  "unparseable address",
+			input: `{"namespace":{"Net":true},"command":["/bin/sh"],"network":{"source":"fcabc","name":"eth0","address":"not-an-address"}}`,
+		},
+		{
+			name:  "interface name the kernel would refuse",
+			input: `{"namespace":{"Net":true},"command":["/bin/sh"],"network":{"source":"fcabc","name":"a-name-far-too-long-for-the-kernel","address":"10.99.0.7/16"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := decodeInitPayload(strings.NewReader(tt.input)); !errors.Is(err, network.ErrInvalidInterface) {
+				t.Errorf("decodeInitPayload() = %v, want %v", err, network.ErrInvalidInterface)
+			}
+		})
+	}
+}
+
+// TestDecodeInitPayloadWithoutAnInterface is Stage 4's equivalent of the
+// no-mount-plan case: host networking sends nothing, and the init must
+// configure nothing.
+func TestDecodeInitPayloadWithoutAnInterface(t *testing.T) {
+	t.Parallel()
+
+	got, err := decodeInitPayload(strings.NewReader(`{"namespace":{"PID":true},"command":["/bin/echo","hi"]}`))
+	if err != nil {
+		t.Fatalf("decodeInitPayload() = %v", err)
+	}
+	if got.Network != nil {
+		t.Errorf("Network = %+v, want nil for a container with host networking", got.Network)
+	}
+	if got.Namespace.Net {
+		t.Error("Namespace.Net = true, want false for a container with host networking")
 	}
 }

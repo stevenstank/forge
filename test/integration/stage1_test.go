@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/stevenstank/forge/internal/logging"
+	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/process"
 	"github.com/stevenstank/forge/internal/runtime"
 )
@@ -283,7 +284,10 @@ func TestExitCodeIsReported(t *testing.T) {
 func TestMissingBinaryReportsInitFailure(t *testing.T) {
 	requireRoot(t)
 
-	spec := runtime.Spec{Command: []string{"/nonexistent/forge-stage1-binary"}}
+	spec := runtime.Spec{
+		Command: []string{"/nonexistent/forge-stage1-binary"},
+		Network: network.ModeHost,
+	}
 	got := runContainer(t.Context(), t, spec)
 
 	if got.status.Code != runtime.InitExitCode {

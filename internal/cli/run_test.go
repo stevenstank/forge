@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/runtime"
 )
 
@@ -276,5 +277,99 @@ func TestInitCommandIsWiredToTheRuntime(t *testing.T) {
 	}
 	if !runtime.IsInitCommand([]string{"forge", cmd.Name}) {
 		t.Errorf("runtime does not recognise %q as its init command", cmd.Name)
+	}
+}
+
+// --- Stage 4 --------------------------------------------------------------
+
+// TestParseRunSpecNetworkFlags covers the only thing this package contributes
+// to Stage 4: carrying the flags through untranslated. An unset -network stays
+// empty rather than being resolved here, because what a container gets when
+// nobody asks is the runtime's decision (SSOT §2).
+func TestParseRunSpecNetworkFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    network.Mode
+		wantMTU int
+	}{
+		{
+			name: "unset stays empty for the runtime to resolve",
+			args: []string{"/bin/echo", "hi"},
+			want: "",
+		},
+		{
+			name: "an explicit mode is passed through",
+			args: []string{"-network", "none", "/bin/sh"},
+			want: network.ModeNone,
+		},
+		{
+			name:    "an mtu is passed through",
+			args:    []string{"-mtu", "1400", "/bin/sh"},
+			want:    "",
+			wantMTU: 1400,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			spec, err := parseRunSpec(tt.args)
+			if err != nil {
+				t.Fatalf("parseRunSpec() = %v", err)
+			}
+			if spec.Network != tt.want {
+				t.Errorf("Network = %q, want %q", spec.Network, tt.want)
+			}
+			if spec.NetworkMTU != tt.wantMTU {
+				t.Errorf("NetworkMTU = %d, want %d", spec.NetworkMTU, tt.wantMTU)
+			}
+		})
+	}
+}
+
+// TestRunCommandStage4ArgumentErrors confirms a bad network flag is rejected
+// before anything is started, and reported as the usage error it is.
+func TestRunCommandStage4ArgumentErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantStderr string
+	}{
+		{
+			name:       "a mode forge does not implement",
+			args:       []string{"run", "-network", "macvlan", "/bin/sh"},
+			wantStderr: "macvlan",
+		},
+		{
+			name:       "an mtu with no interface to put it on",
+			args:       []string{"run", "-network", "host", "-mtu", "1400", "/bin/sh"},
+			wantStderr: "-mtu needs an interface",
+		},
+		{
+			name:       "an mtu the kernel would refuse",
+			args:       []string{"run", "-mtu", "70000", "/bin/sh"},
+			wantStderr: "invalid MTU",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			a, _, stderr := newTestApp(commands()...)
+
+			if got := a.run(t.Context(), tt.args); got != ExitUsage {
+				t.Errorf("exit code = %d, want %d (stderr: %q)", got, ExitUsage, stderr)
+			}
+			if !strings.Contains(stderr.String(), tt.wantStderr) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr, tt.wantStderr)
+			}
+		})
 	}
 }
