@@ -245,6 +245,39 @@ func ReadInt64(t *testing.T, path string) int64 {
 	return value
 }
 
+// Procs returns the PIDs that are members of the cgroup at dir, from
+// cgroup.procs.
+//
+// This is how a test asks "is anything in this cgroup?". It deliberately does
+// not use pids.current, which looks like the obvious choice and is a trap: a
+// controller's interface files exist in a cgroup only when that controller is
+// enabled in its parent's cgroup.subtree_control, and Forge delegates only the
+// controllers a container's limits actually require. A leaf created with no
+// limits, or with only a memory limit, therefore has no pids.current at all,
+// and reading it fails with ENOENT — which is easily misread as the cgroup
+// having been destroyed. cgroup.procs is a core interface file and is present
+// in every cgroup unconditionally.
+func Procs(t *testing.T, dir string) []int {
+	t.Helper()
+
+	path := filepath.Join(dir, "cgroup.procs")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+
+	var pids []int
+	for _, field := range strings.Fields(string(content)) {
+		pid, err := strconv.Atoi(field)
+		if err != nil {
+			t.Fatalf("%s contains %q, want process IDs: %v", path, field, err)
+		}
+		pids = append(pids, pid)
+	}
+
+	return pids
+}
+
 // KeyedValue reads one field from a cgroup "flat keyed" file — memory.events,
 // cpu.stat, pids.events — each line of which is "key value".
 func KeyedValue(t *testing.T, path, key string) int64 {
@@ -305,11 +338,22 @@ func (b *SyncBuffer) String() string {
 //	test       → "go"           when the test has finished preparing the cgroup
 //	container  → whatever it observed
 //	test       → closes stdin   which is the container's signal to exit
+//
+// The container's stdin is a real os.Pipe rather than an io.Pipe, and that is
+// load-bearing rather than incidental. os/exec wires an *os.File straight
+// through to the child as a file descriptor, but any other io.Reader gets a
+// copying goroutine — and cmd.Wait does not return until that goroutine stops
+// reading. A test that holds the container's stdin open while waiting for the
+// container to die on its own would therefore wait forever: the container is
+// gone, but the copier is still blocked on a Read that will never complete, so
+// Run cannot return. With a real pipe there is no copier, and Run returns as
+// soon as the container does, whoever is still holding the write end.
 type Live struct {
 	Stdout *SyncBuffer
 	Stderr *SyncBuffer
 
-	stdin  *io.PipeWriter
+	stdin  *os.File
+	reader *os.File
 	cancel context.CancelFunc
 	done   chan struct{}
 
@@ -329,11 +373,17 @@ func StartLive(ctx context.Context, t *testing.T, spec runtime.Spec) *Live {
 
 	ctx, cancel := context.WithCancel(ctx)
 
-	stdinReader, stdinWriter := io.Pipe()
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("creating the container's stdin pipe: %v", err)
+	}
+
 	live := &Live{
 		Stdout: &SyncBuffer{},
 		Stderr: &SyncBuffer{},
 		stdin:  stdinWriter,
+		reader: stdinReader,
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
@@ -357,6 +407,10 @@ func StartLive(ctx context.Context, t *testing.T, spec runtime.Spec) *Live {
 	t.Cleanup(func() {
 		live.stop(t)
 		cancel()
+		// The child holds its own descriptor for the read end; this is the
+		// parent's copy, closed once the container is gone so a long suite does
+		// not accumulate one open pipe per test.
+		_ = live.reader.Close()
 		t.Logf("forge log:\n%s", logs.String())
 		if out := live.Stdout.String(); out != "" {
 			t.Logf("container stdout:\n%s", out)
@@ -382,7 +436,9 @@ func (l *Live) Send(t *testing.T, line string) {
 func (l *Live) CloseStdin(t *testing.T) {
 	t.Helper()
 
-	if err := l.stdin.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+	// Closing twice is not an error: a test may close stdin explicitly and the
+	// registered cleanup will then close it again.
+	if err := l.stdin.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 		t.Errorf("closing the container's stdin: %v", err)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -474,6 +475,70 @@ func TestCPUQuotaIsEnforced(t *testing.T) {
 	})
 }
 
+// TestCPUWeightIsApplied covers the share-based half of FR-3.3 against the
+// kernel.
+//
+// A weight is not a ceiling and has no observable effect on a container running
+// alone: it only decides how CPU is divided between siblings that are both
+// runnable, so there is no throttling counter to assert on and no way to make
+// one container's weight visible in its own behaviour. What the kernel can be
+// asked is whether it accepted the value and is holding it, which is read back
+// from the container's own leaf while the container is still running — not from
+// what Forge believes it wrote.
+//
+// Two weights are checked, one either side of the kernel's default of 100, so a
+// pass cannot come from Forge writing a constant or from the leaf having simply
+// inherited the default.
+func TestCPUWeightIsApplied(t *testing.T) {
+	requireRoot(t)
+	testutil.RequireCgroupV2(t)
+	t.Cleanup(func() { testutil.RemoveForgeCgroupIfEmpty(t) })
+
+	tests := []struct {
+		name   string
+		weight cgroup.Weight
+	}{
+		{name: "above the kernel's default", weight: 512},
+		{name: "below the kernel's default", weight: 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.weight == cgroup.DefaultWeight {
+				t.Fatalf("weight %d is the kernel's default, so the assertion below would prove nothing", tt.weight)
+			}
+
+			weight := tt.weight
+			live, leaf := startLimited(t, stage3Spec(t, stage3ModeHold, cgroup.Limits{CPUWeight: &weight}))
+
+			// The file existing at all is the cpu controller having been
+			// delegated down to the leaf; its contents are the limit itself.
+			if got := testutil.ReadInt64(t, filepath.Join(leaf, "cpu.weight")); got != int64(tt.weight) {
+				t.Errorf("%s: cpu.weight = %d, want %d",
+					filepath.Join(leaf, "cpu.weight"), got, tt.weight)
+			}
+
+			// A weight left unset must stay unset: FR-3.3's two halves are
+			// orthogonal, and a container given only a share must not also
+			// acquire a ceiling it never asked for.
+			cpuMax, err := os.ReadFile(filepath.Join(leaf, "cpu.max"))
+			if err != nil {
+				t.Fatalf("reading cpu.max: %v", err)
+			}
+			if got := strings.TrimSpace(string(cpuMax)); !strings.HasPrefix(got, "max ") {
+				t.Errorf("cpu.max = %q, want it left unlimited alongside a weight-only container", got)
+			}
+
+			// A weight constrains nothing on its own, so the container must
+			// still run and exit normally under it.
+			live.CloseStdin(t)
+			if status := live.Wait(t, testutil.DefaultTimeout); status.Code != 0 {
+				t.Errorf("container exited %v, want 0: a cpu.weight is a share, not a limit", status)
+			}
+		})
+	}
+}
+
 // TestContainerCgroupIsRemovedOnExit covers FR-3.1 and FR-3.5 end to end: the
 // leaf exists while the container does, and is gone the moment Run returns.
 func TestContainerCgroupIsRemovedOnExit(t *testing.T) {
@@ -486,9 +551,12 @@ func TestContainerCgroupIsRemovedOnExit(t *testing.T) {
 	memory := cgroup.Bytes(64 << 20)
 	live, leaf := startLimited(t, stage3Spec(t, stage3ModeHold, cgroup.Limits{MemoryMax: &memory}))
 
-	// FR-3.1: a leaf of its own, holding the container's init.
-	if got := testutil.ReadInt64(t, filepath.Join(leaf, "pids.current")); got < 1 {
-		t.Errorf("pids.current = %d, want the container's own processes", got)
+	// FR-3.1: a leaf of its own, holding the container's init. Membership is
+	// read from cgroup.procs rather than pids.current: this container limits
+	// only memory, so only the memory controller is delegated to its leaf and
+	// no pids.* file exists there to read.
+	if got := testutil.Procs(t, leaf); len(got) < 1 {
+		t.Errorf("cgroup.procs = %v, want the container's own processes", got)
 	}
 
 	live.CloseStdin(t)
@@ -538,7 +606,19 @@ func TestDestroyEvictsSurvivors(t *testing.T) {
 		t.Fatalf("os.Executable() = %v", err)
 	}
 
-	stdin, stdinWriter := io.Pipe()
+	// A real pipe, not an io.Pipe, for the same reason testutil.Live uses one:
+	// os/exec passes an *os.File through to the child as a descriptor, but wraps
+	// any other io.Reader in a copying goroutine that Wait refuses to return
+	// without. This test holds the write end open on purpose — that is what
+	// keeps the survivor blocked and unable to exit of its own accord — so with
+	// an io.Pipe the copier would still be parked in Read long after the
+	// survivor was killed, and Wait would never report the death it is here to
+	// observe.
+	stdin, stdinWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating the survivor's stdin pipe: %v", err)
+	}
+
 	survivor := exec.Command(exe)
 	survivor.Env = []string{helperEnv + "=" + stage3ModeIgnoreSigterm, "GOMAXPROCS=2"}
 	survivor.Stdin = stdin
@@ -549,12 +629,25 @@ func TestDestroyEvictsSurvivors(t *testing.T) {
 		t.Fatalf("starting the survivor: %v", err)
 	}
 
+	// One send, but up to three receives: the SIGTERM check below, the eviction
+	// assertion after it, and the cleanup. Closing after the send is what makes
+	// the later receives safe — whichever one arrives first takes the status,
+	// and every subsequent receive completes immediately on the closed channel
+	// instead of waiting for a second send that never comes.
 	waited := make(chan error, 1)
-	go func() { waited <- survivor.Wait() }()
+	go func() {
+		waited <- survivor.Wait()
+		close(waited)
+	}()
 	t.Cleanup(func() {
 		_ = stdinWriter.Close()
 		_ = survivor.Process.Kill()
+		// Returns once the Wait goroutine has finished, so the survivor is
+		// reaped before the descriptor below is released.
 		<-waited
+		// The child has its own descriptor for the read end; this is the
+		// parent's copy.
+		_ = stdin.Close()
 	})
 
 	testutil.PollUntil(t, "the survivor to start", testutil.DefaultTimeout, func() bool {
@@ -564,8 +657,12 @@ func TestDestroyEvictsSurvivors(t *testing.T) {
 	if err := manager.Add(id, survivor.Process.Pid); err != nil {
 		t.Fatalf("Add() = %v", err)
 	}
-	if got := testutil.ReadInt64(t, filepath.Join(leaf, "pids.current")); got < 1 {
-		t.Fatalf("pids.current = %d, want the survivor to have joined", got)
+	// This leaf was created with no limits at all, so no controller is
+	// delegated to it and it has no pids.* file. cgroup.procs is a core
+	// interface file and is the direct evidence wanted here anyway: the
+	// survivor is a member of this cgroup.
+	if got := testutil.Procs(t, leaf); !slices.Contains(got, survivor.Process.Pid) {
+		t.Fatalf("cgroup.procs = %v, want it to contain the survivor (pid %d)", got, survivor.Process.Pid)
 	}
 
 	// It ignores the polite signal, which is what makes this a test of

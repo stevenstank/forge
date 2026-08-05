@@ -6,10 +6,10 @@ package main
 
 import (
 	"context"
+	"github.com/stevenstank/forge/internal/cli"
 	"os"
 	"os/signal"
 	"syscall"
-	"github.com/stevenstank/forge/internal/cli"
 )
 
 func main() {

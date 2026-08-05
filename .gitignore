@@ -36,4 +36,4 @@ go.work.sum
 
 .claude
 .github
-docs/adr
+/docs/adr/
