@@ -114,14 +114,17 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/stevenstank/forge/internal/cgroup"
 	"github.com/stevenstank/forge/internal/image"
+	"github.com/stevenstank/forge/internal/logs"
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
 	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/process"
 	"github.com/stevenstank/forge/internal/rootfs"
+	"github.com/stevenstank/forge/internal/state"
 )
 
 // InitCommandName is the hidden subcommand Forge re-executes itself as, to run
@@ -154,6 +157,14 @@ type Config struct {
 	// verbatim: the runtime decides *which* image to pull, never how long a
 	// registry may take to answer.
 	Registry image.ClientConfig
+
+	// StateDir is the directory container metadata is persisted under, from
+	// the --state-dir flag (SSOT §9). Empty means DefaultStateDir.
+	//
+	// It is the parent of the state store's tree rather than the tree itself,
+	// so the records of a Forge and the logs of the same Forge sit side by
+	// side under one directory a user can point at.
+	StateDir string
 
 	// CgroupRoot is the mount point of the cgroup v2 unified hierarchy.
 	// Empty means cgroup.DefaultRoot, which is where every distribution
@@ -242,6 +253,17 @@ type Spec struct {
 	// here for hosts whose uplink is itself tunnelled. Requires a mode with
 	// an interface to apply it to.
 	NetworkMTU int
+
+	// Keep retains the container's record and root filesystem after it exits,
+	// so that `forge ps -a` can list it and `forge logs` could read it, until
+	// `forge rm` removes it.
+	//
+	// The default is not to: an attached run's output has already gone to the
+	// user's terminal, and Stages 1 to 5 have always left nothing behind. What
+	// changes that calculation is a container whose output exists only in a
+	// file — which is what the detached mode this flag anticipates produces,
+	// and why it will default the other way when it lands.
+	Keep bool
 
 	// Stdin, Stdout and Stderr are wired to the container process.
 	Stdin  io.Reader
@@ -476,6 +498,24 @@ type Runner struct {
 	networks *network.Manager
 	images   *image.Cache
 	registry *image.Client
+	state    *state.Store
+	logs     *logs.Store
+
+	// openProcess opens a handle on a container's init process. It is a field
+	// so that the whole of `forge stop` — signal, grace period, kill — is
+	// testable without root, without a real container, and without waiting on
+	// a real process to die. There is one implementation in production, so it
+	// is a function rather than an interface (the same reasoning, and the same
+	// shape, as internal/network's reclaimStale).
+	openProcess func(pid int) (containerProcess, error)
+
+	// pollInterval is how often Stop re-checks a container it is waiting on,
+	// and killGrace is how long it waits after SIGKILL. Both are fields for
+	// the same reason as openProcess: a test that had to wait out the real
+	// values would be a test nobody runs (SSOT §7 forbids sleeps in tests, and
+	// this is how that is kept possible).
+	pollInterval time.Duration
+	killGrace    time.Duration
 }
 
 // NewRunner returns a Runner that logs through logger and stores container root
@@ -517,13 +557,32 @@ func NewRunner(logger *slog.Logger, cfg Config) (*Runner, error) {
 		return nil, err
 	}
 
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		stateDir = DefaultStateDir
+	}
+	records, err := state.New(stateDir)
+	if err != nil {
+		return nil, err
+	}
+
+	captured, err := logs.New(filepath.Join(stateDir, logsDirName))
+	if err != nil {
+		return nil, err
+	}
+
 	return &Runner{
-		logger:   logger,
-		store:    store,
-		cgroups:  cgroup.New(cfg.CgroupRoot),
-		networks: networks,
-		images:   images,
-		registry: registry,
+		logger:       logger,
+		store:        store,
+		cgroups:      cgroup.New(cfg.CgroupRoot),
+		networks:     networks,
+		images:       images,
+		registry:     registry,
+		state:        records,
+		logs:         captured,
+		openProcess:  openContainerProcess,
+		pollInterval: defaultPollInterval,
+		killGrace:    KillGrace,
 	}, nil
 }
 
@@ -556,6 +615,13 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	cleanup := newCleanupStack(log)
 	defer cleanup.unwind()
 
+	// retain is set once the container has actually run. Until then, every
+	// path out of Run removes the record and the filesystem along with
+	// everything else: a container that failed to start is not a container a
+	// user asked to keep, and Stages 1 to 5 leave nothing behind when a run
+	// fails.
+	retain := false
+
 	// Steps 1 to 4, and they happen before the stack has a single entry on it.
 	// The image is resolved, downloaded and verified while the only things
 	// Forge has touched are the network and the shared blob cache — so every
@@ -574,9 +640,48 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 		}
 	}
 
+	// The record, and it goes here for the same reason steps 1 to 4 went
+	// first: it is the last moment before anything container-specific exists
+	// on the host, and the first moment at which there is something to
+	// attribute. Everything below creates a resource that a `forge rm` running
+	// tomorrow will have to find, and the record is how it finds them
+	// (FR-6.5).
+	//
+	// Not before the pull, deliberately. A mistyped image name is the
+	// commonest failure in the whole runtime, and Stage 5's arrangement makes
+	// it cost nothing — no directory created, no address claimed, nothing to
+	// unwind. Creating a record above would have bought a `forge ps` that
+	// shows a container while its image downloads, and paid for it by making
+	// the cheapest failure in Forge write to disk twice.
+	//
+	// Registered first on the stack, so it unwinds last: the record is the
+	// list of what to clean up, so it cannot be the first thing cleaned up.
+	if err := r.createRecord(id, spec); err != nil {
+		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
+	}
+	cleanup.push("removing the container record", func() error {
+		if retain {
+			return nil
+		}
+		return r.state.Remove(id)
+	})
+
+	// The log, second on the stack and second to be acquired: everything
+	// below this point can produce output, and output with nowhere to go is
+	// output lost. Capturing it costs a file and changes nothing about how an
+	// attached run behaves — the caller's terminal is still written to, and
+	// the log is a second copy (FR-6.4).
+	spec, captured, err := r.openLogs(spec, id)
+	if err != nil {
+		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
+	}
+	cleanup.push("closing the container log", func() error {
+		return r.closeLogs(captured, id, &retain)
+	})
+
 	// Steps 5 and 6: the container's directory, its contents unpacked from the
 	// image, and the plan describing what its init will mount.
-	plan, err := r.prepareFilesystem(ctx, log, id, spec, img, cleanup)
+	plan, err := r.prepareFilesystem(ctx, log, id, spec, img, cleanup, &retain)
 	if err != nil {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
@@ -636,10 +741,20 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 		"clone_flags", fmt.Sprintf("%#x", nsCfg.CloneFlags()),
 	)
 
-	status, err := r.start(ctx, log, self, payload, nsCfg, spec, cgroupID, cnet)
+	status, err := r.start(ctx, log, id, self, payload, nsCfg, spec, cgroupID, cnet)
 	if err != nil {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
+
+	// The container ran, so it is now a container a user may have asked to
+	// keep. This is also the last moment at which that is still a decision:
+	// the deferred unwind below reads it.
+	retain = spec.Keep
+
+	// Recorded before the unwind, because the unwind may delete the record
+	// this is written into — and because a `forge stop` waiting for this
+	// container to finish is watching for exactly this write.
+	r.recordExit(log, id, status)
 
 	log.Info("container exited", "exit_code", status.Code, "status", status.String())
 
@@ -672,6 +787,7 @@ func (r *Runner) prepareFilesystem(
 	spec Spec,
 	img *containerImage,
 	cleanup *cleanupStack,
+	retain *bool,
 ) (*mount.Plan, error) {
 	if spec.Rootfs == "" && img == nil {
 		return nil, nil
@@ -689,7 +805,16 @@ func (r *Runner) prepareFilesystem(
 	if err != nil {
 		return nil, err
 	}
+	r.recordFilesystem(log, id, dir.Rootfs)
 	cleanup.push("removing the container root filesystem", func() error {
+		// A kept container keeps its filesystem: it is what `forge ps -a`
+		// describes and what `forge rm` removes. retain is a pointer because
+		// it is not decided until the container has run — a container that
+		// failed to start leaves nothing behind, whatever was asked for.
+		if *retain {
+			return nil
+		}
+
 		// Cleanup runs after the container is gone, which includes the case
 		// where ctx was cancelled to kill it. Inheriting that cancellation
 		// would mean an interrupted run leaked exactly what it was cancelled
@@ -763,6 +888,7 @@ func (r *Runner) prepareFilesystem(
 func (r *Runner) start(
 	ctx context.Context,
 	log *slog.Logger,
+	id string,
 	self string,
 	payload []byte,
 	nsCfg namespace.Config,
@@ -806,6 +932,13 @@ func (r *Runner) start(
 
 	log.Info("container started", "pid", p.PID(), "state", p.State().String())
 
+	// Recorded in the handshake window, alongside the cgroup attach and for
+	// the same reason: this is the first moment the PID exists, and the
+	// container has still not run an instruction of its own. A `forge stop`
+	// arriving between here and the payload write finds a container it can
+	// signal rather than one it can only watch.
+	r.recordCreated(log, id, p.PID())
+
 	// The container joins its cgroup here, in the window the handshake opens.
 	//
 	// A cgroup can only be joined by writing a PID to cgroup.procs, so there is
@@ -843,6 +976,10 @@ func (r *Runner) start(
 		r.abandon(ctx, log, p, "a failed handshake")
 		return process.Status{}, err
 	}
+
+	// The payload released the child, so from here the container's own binary
+	// is what is executing.
+	r.recordRunning(log, id)
 
 	status, err := p.Wait(ctx)
 	if err != nil {

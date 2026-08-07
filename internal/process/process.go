@@ -121,6 +121,17 @@ type Config struct {
 	// ExtraFiles are inherited by the child starting at file descriptor 3, in
 	// order.
 	ExtraFiles []*os.File
+
+	// CgroupFD is a directory the kernel places the child in as it creates
+	// it, via clone3(2)'s CLONE_INTO_CGROUP. Nil starts the child wherever
+	// the caller is.
+	//
+	// This package is not told what the directory means, only that the child
+	// is to be born inside it. What it buys over writing the child's PID
+	// somewhere after the fact is that there is no "after the fact": a
+	// process placed into a cgroup once it is already running has, however
+	// briefly, run outside it.
+	CgroupFD *os.File
 }
 
 // Validate reports whether the configuration can be started. It is pure and
@@ -167,6 +178,10 @@ func New(cfg Config) (*Process, error) {
 		SysProcAttr: &syscall.SysProcAttr{
 			Cloneflags: cfg.CloneFlags,
 		},
+	}
+	if cfg.CgroupFD != nil {
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = int(cfg.CgroupFD.Fd())
 	}
 	if cmd.Env == nil {
 		cmd.Env = []string{}

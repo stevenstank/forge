@@ -64,7 +64,7 @@ func TestMain(m *testing.M) {
 		os.Exit(code)
 	}
 
-	for _, dispatch := range []func(string) (int, bool){stage1Helper, stage2Helper, stage3Helper, stage4Helper} {
+	for _, dispatch := range []func(string) (int, bool){stage1Helper, stage2Helper, stage3Helper, stage4Helper, stage6Helper} {
 		if code, handled := dispatch(mode); handled {
 			os.Exit(code)
 		}
@@ -107,7 +107,11 @@ func runContainerIn(ctx context.Context, t *testing.T, root string, spec runtime
 	spec.Stdout = &stdout
 	spec.Stderr = &stderr
 
-	runner, err := runtime.NewRunner(logging.New(&logs, slog.LevelDebug), runtime.Config{Root: root})
+	stateDir := t.TempDir()
+	runner, err := runtime.NewRunner(logging.New(&logs, slog.LevelDebug), runtime.Config{
+		Root:     root,
+		StateDir: stateDir,
+	})
 	if err != nil {
 		t.Fatalf("NewRunner() = %v", err)
 	}

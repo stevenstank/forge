@@ -51,6 +51,8 @@ type runFlags struct {
 
 	network string
 	mtu     int
+
+	keep bool
 }
 
 // mountList collects repeated -mount flags. Parsing each one immediately means
@@ -111,6 +113,12 @@ func newRunFlagSet() (*flag.FlagSet, *runFlags) {
 	// secret kept in a struct tag.
 	fs.StringVar(&local.network, "network", "", "network `mode`: bridge, none or host (default: bridge)")
 	fs.IntVar(&local.mtu, "mtu", 0, "MTU of the container's interface (default: the kernel's)")
+
+	// Retention (FR-6.1, FR-6.6). The default is to leave nothing behind,
+	// which is what every stage so far has done and what PRD §10.4 asks of the
+	// test suite. -keep is how a user asks for a container that outlives its
+	// run, so that forge ps -a can list it and forge rm removes it.
+	fs.BoolVar(&local.keep, "keep", false, "keep the container's record and filesystem after it exits, for forge ps -a and forge rm")
 
 	return fs, &local
 }
@@ -237,6 +245,7 @@ func parseRunSpec(args []string) (runtime.Spec, error) {
 		Limits:       limits,
 		Network:      network.Mode(local.network),
 		NetworkMTU:   local.mtu,
+		Keep:         local.keep,
 	}
 	if err := spec.Validate(); err != nil {
 		return runtime.Spec{}, err
@@ -275,10 +284,7 @@ func execRun(ctx context.Context, env *Env, args []string) error {
 		spec.Env = defaultContainerEnv()
 	}
 
-	runner, err := runtime.NewRunner(env.Logger, runtime.Config{
-		Root:      env.Opts.Root,
-		ImageRoot: env.Opts.ImageRoot,
-	})
+	runner, err := newRunner(env)
 	if err != nil {
 		return err
 	}

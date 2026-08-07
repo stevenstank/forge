@@ -41,6 +41,7 @@ func newImageRunner(t *testing.T) (*runtime.Runner, string, string) {
 		logging.New(io.Discard, slog.LevelError),
 		runtime.Config{
 			Root:       root,
+			StateDir:   t.TempDir(),
 			ImageRoot:  imageRoot,
 			CgroupRoot: fakeCgroupRoot(t),
 			// One attempt, so a test that expects an unreachable registry does

@@ -123,8 +123,26 @@ type Command struct {
 func commands() []Command {
 	return []Command{
 		newRunCommand(),
+		newPsCommand(),
+		newStopCommand(),
+		newExecCommand(),
+		newLogsCommand(),
+		newRemoveCommand(),
 		newInitCommand(),
 	}
+}
+
+// newRunner builds the Runner a command works through, from the global flags.
+//
+// It is shared by every verb so that they all agree on where Forge's state
+// lives: a `forge ps` looking in a different directory from the `forge run`
+// that created the container would report nothing and be very hard to explain.
+func newRunner(env *Env) (*runtime.Runner, error) {
+	return runtime.NewRunner(env.Logger, runtime.Config{
+		Root:      env.Opts.Root,
+		StateDir:  env.Opts.StateDir,
+		ImageRoot: env.Opts.ImageRoot,
+	})
 }
 
 // Run executes a single forge invocation and returns the process exit code.

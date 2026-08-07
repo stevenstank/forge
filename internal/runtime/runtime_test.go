@@ -27,6 +27,7 @@ func newRunner(t *testing.T) *runtime.Runner {
 		logging.New(io.Discard, slog.LevelError),
 		runtime.Config{
 			Root:       filepath.Join(t.TempDir(), "containers"),
+			StateDir:   t.TempDir(),
 			CgroupRoot: fakeCgroupRoot(t),
 		},
 	)
@@ -351,7 +352,7 @@ func TestRunLeavesNoContainerDirectoryWhenItFailsEarly(t *testing.T) {
 	t.Parallel()
 
 	root := filepath.Join(t.TempDir(), "containers")
-	runner, err := runtime.NewRunner(logging.New(io.Discard, slog.LevelError), runtime.Config{Root: root})
+	runner, err := runtime.NewRunner(logging.New(io.Discard, slog.LevelError), runtime.Config{Root: root, StateDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("NewRunner() = %v", err)
 	}
@@ -519,7 +520,7 @@ func TestRunRejectsInvalidLimitsBeforeForking(t *testing.T) {
 	cgroupRoot := fakeCgroupRoot(t)
 	runner, err := runtime.NewRunner(
 		logging.New(io.Discard, slog.LevelError),
-		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: cgroupRoot},
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), StateDir: t.TempDir(), CgroupRoot: cgroupRoot},
 	)
 	if err != nil {
 		t.Fatalf("NewRunner() = %v", err)
@@ -551,7 +552,7 @@ func TestRunCreatesAndDestroysTheContainerCgroup(t *testing.T) {
 	cgroupRoot := fakeCgroupRoot(t)
 	runner, err := runtime.NewRunner(
 		logging.New(io.Discard, slog.LevelError),
-		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: cgroupRoot},
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), StateDir: t.TempDir(), CgroupRoot: cgroupRoot},
 	)
 	if err != nil {
 		t.Fatalf("NewRunner() = %v", err)
@@ -588,7 +589,7 @@ func TestRunFailsWhenLimitsCannotBeApplied(t *testing.T) {
 	// host looks like from here.
 	runner, err := runtime.NewRunner(
 		logging.New(io.Discard, slog.LevelError),
-		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: t.TempDir()},
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), StateDir: t.TempDir(), CgroupRoot: t.TempDir()},
 	)
 	if err != nil {
 		t.Fatalf("NewRunner() = %v", err)
@@ -611,7 +612,7 @@ func TestRunWithoutLimitsToleratesAMissingHierarchy(t *testing.T) {
 	var logs strings.Builder
 	runner, err := runtime.NewRunner(
 		logging.New(&logs, slog.LevelWarn),
-		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), CgroupRoot: t.TempDir()},
+		runtime.Config{Root: filepath.Join(t.TempDir(), "containers"), StateDir: t.TempDir(), CgroupRoot: t.TempDir()},
 	)
 	if err != nil {
 		t.Fatalf("NewRunner() = %v", err)

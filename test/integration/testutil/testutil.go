@@ -371,6 +371,41 @@ type Live struct {
 func StartLive(ctx context.Context, t *testing.T, spec runtime.Spec) *Live {
 	t.Helper()
 
+	return StartLiveWithRunner(ctx, t, NewRunner(t), spec)
+}
+
+// NewRunner returns a Runner whose state, containers and logs all live under
+// the test's own temporary directory.
+//
+// Pointing the state directory at a temp dir is what keeps a privileged test
+// run from writing container records into the host's real /var/lib/forge — and
+// from being confused by any that a previous run left there (PRD §10.4).
+func NewRunner(t *testing.T) *runtime.Runner {
+	t.Helper()
+
+	dir := t.TempDir()
+	runner, err := runtime.NewRunner(
+		logging.New(io.Discard, slog.LevelError),
+		runtime.Config{
+			Root:     filepath.Join(dir, "containers"),
+			StateDir: dir,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewRunner() = %v", err)
+	}
+
+	return runner
+}
+
+// StartLiveWithRunner is StartLive against a Runner the test already holds.
+//
+// Stage 6's verbs act on a container through the Runner that started it — the
+// record is how `ps`, `exec` and `stop` find a container at all — so a test
+// that wants to exec into a live container has to share one.
+func StartLiveWithRunner(ctx context.Context, t *testing.T, runner *runtime.Runner, spec runtime.Spec) *Live {
+	t.Helper()
+
 	ctx, cancel := context.WithCancel(ctx)
 
 	stdinReader, stdinWriter, err := os.Pipe()
@@ -392,13 +427,6 @@ func StartLive(ctx context.Context, t *testing.T, spec runtime.Spec) *Live {
 	spec.Stdout = live.Stdout
 	spec.Stderr = live.Stderr
 
-	var logs SyncBuffer
-	runner, err := runtime.NewRunner(logging.New(&logs, slog.LevelDebug), runtime.Config{Root: t.TempDir()})
-	if err != nil {
-		cancel()
-		t.Fatalf("NewRunner() = %v", err)
-	}
-
 	go func() {
 		defer close(live.done)
 		live.status, live.err = runner.Run(ctx, spec)
@@ -411,7 +439,6 @@ func StartLive(ctx context.Context, t *testing.T, spec runtime.Spec) *Live {
 		// parent's copy, closed once the container is gone so a long suite does
 		// not accumulate one open pipe per test.
 		_ = live.reader.Close()
-		t.Logf("forge log:\n%s", logs.String())
 		if out := live.Stdout.String(); out != "" {
 			t.Logf("container stdout:\n%s", out)
 		}
@@ -422,6 +449,11 @@ func StartLive(ctx context.Context, t *testing.T, spec runtime.Spec) *Live {
 
 	return live
 }
+
+// Done is closed when the container has exited. It lets a test assert that a
+// container is *still running* without waiting for it, which is the shape of
+// every "this did not disturb the container" check.
+func (l *Live) Done() <-chan struct{} { return l.done }
 
 // Send writes a line to the container's stdin.
 func (l *Live) Send(t *testing.T, line string) {

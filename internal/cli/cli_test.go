@@ -299,8 +299,8 @@ func TestUsageOmitsEmptyCommandSection(t *testing.T) {
 }
 
 // TestRegisteredCommandsMatchTheCurrentStage pins the stage boundary: no verb
-// from SSOT §9 may be registered until its own stage implements it. Stage 1
-// delivers "run" and the internal init entry point, and nothing else.
+// from SSOT §9 may be registered until its own stage implements it. With exec
+// in place, Stage 6 completes the set — every verb SSOT §9 names now exists.
 func TestRegisteredCommandsMatchTheCurrentStage(t *testing.T) {
 	t.Parallel()
 
@@ -309,15 +309,15 @@ func TestRegisteredCommandsMatchTheCurrentStage(t *testing.T) {
 		got = append(got, c.Name)
 	}
 
-	want := []string{"run", "__init"}
+	want := []string{"run", "ps", "stop", "exec", "logs", "rm", "__init"}
 	if !slices.Equal(got, want) {
 		t.Errorf("commands() = %v, want %v", got, want)
 	}
 
-	// Verbs belonging to Stages 2-6 must not exist yet.
-	for _, later := range []string{"ps", "exec", "stop", "logs", "rm"} {
-		if slices.Contains(got, later) {
-			t.Errorf("%q is registered but belongs to a later stage", later)
+	// Every verb SSOT §9 names is registered, and nothing beyond them is.
+	for _, verb := range []string{"run", "ps", "exec", "stop", "logs", "rm"} {
+		if !slices.Contains(got, verb) {
+			t.Errorf("%q is named by SSOT §9 but is not registered", verb)
 		}
 	}
 }
