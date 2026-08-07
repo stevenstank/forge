@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 
 	"github.com/stevenstank/forge/internal/logging"
+	"github.com/stevenstank/forge/internal/runtime"
 )
 
 // Process exit codes, per SSOT §9.
@@ -35,6 +36,10 @@ const (
 	DefaultStateDir = "/var/lib/forge"
 	// DefaultRoot is where per-container root filesystems are stored.
 	DefaultRoot = "/var/lib/forge/containers"
+	// DefaultImageRoot is where downloaded image layers are cached. It is a
+	// sibling of DefaultRoot rather than a child so the two can be pointed at
+	// different filesystems.
+	DefaultImageRoot = runtime.DefaultImageRoot
 )
 
 // ErrUsage marks an error as caused by how the user invoked Forge rather than
@@ -75,6 +80,8 @@ type Options struct {
 	StateDir string
 	// Root is the directory holding per-container root filesystems.
 	Root string
+	// ImageRoot is the directory holding the cache of downloaded image layers.
+	ImageRoot string
 }
 
 // Env carries the dependencies a command needs to do its work. It exists so
@@ -207,9 +214,10 @@ func (a *app) lookup(name string) *Command {
 
 // globalFlags holds the destinations of Forge's root-level flags.
 type globalFlags struct {
-	logLevel string
-	stateDir string
-	root     string
+	logLevel  string
+	stateDir  string
+	root      string
+	imageRoot string
 }
 
 // newGlobalFlagSet builds the root-level flag set. Errors and usage are
@@ -224,6 +232,7 @@ func newGlobalFlagSet() (*flag.FlagSet, *globalFlags) {
 	fs.StringVar(&g.logLevel, "log-level", "info", "minimum log severity: debug, info, warn, or error")
 	fs.StringVar(&g.stateDir, "state-dir", DefaultStateDir, "directory holding persisted container state")
 	fs.StringVar(&g.root, "root", DefaultRoot, "directory holding container root filesystems")
+	fs.StringVar(&g.imageRoot, "image-root", DefaultImageRoot, "directory holding the cache of downloaded image layers")
 
 	return fs, &g
 }
@@ -254,11 +263,15 @@ func parseGlobals(args []string) (Options, []string, error) {
 	if !filepath.IsAbs(g.root) {
 		return Options{}, nil, fmt.Errorf("%w: -root must be an absolute path, got %q", ErrUsage, g.root)
 	}
+	if !filepath.IsAbs(g.imageRoot) {
+		return Options{}, nil, fmt.Errorf("%w: -image-root must be an absolute path, got %q", ErrUsage, g.imageRoot)
+	}
 
 	opts := Options{
-		LogLevel: level,
-		StateDir: filepath.Clean(g.stateDir),
-		Root:     filepath.Clean(g.root),
+		LogLevel:  level,
+		StateDir:  filepath.Clean(g.stateDir),
+		Root:      filepath.Clean(g.root),
+		ImageRoot: filepath.Clean(g.imageRoot),
 	}
 	return opts, fs.Args(), nil
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/stevenstank/forge/internal/cgroup"
+	"github.com/stevenstank/forge/internal/image"
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/rootfs"
@@ -161,6 +162,45 @@ func parseLimits(local *runFlags) (cgroup.Limits, error) {
 	return limits, nil
 }
 
+// splitImageAndCommand decides whether the first positional argument names an
+// image or is the command itself.
+//
+// Stage 5 adds a positional `<image>` to a verb whose first positional has meant
+// "the command" since Stage 1, and both grammars have to keep working:
+//
+//	forge run [flags] <image> [cmd] [args...]      new: the command is optional
+//	forge run [flags] -rootfs <dir> <cmd> [args…]  Stage 2–4, unchanged
+//	forge run [flags] <cmd-path> [args...]         Stage 1, unchanged
+//
+// Three rules, applied in order, decide it without a lookahead and without a
+// new flag:
+//
+//  1. -rootfs was given, so the container's filesystem is already named and the
+//     positionals are the command. Exactly Stages 2 to 4.
+//  2. The first positional begins with "/", "./" or "../", so it is a path.
+//     Exactly Stage 1.
+//  3. Otherwise it is an image reference, and the rest is the command.
+//
+// The two namespaces cannot overlap, which is what makes this unambiguous
+// rather than merely conventional: a command Forge accepts without an image
+// must be an absolute path (runtime.ErrNotAPath, Stage 1), and a registry
+// reference can never begin with "/" — "docker.io/library/alpine" has slashes,
+// but not a leading one.
+func splitImageAndCommand(rootfsFlag string, positional []string) (imageRef string, command []string) {
+	if rootfsFlag != "" || isCommandPath(positional[0]) {
+		return "", positional
+	}
+	return positional[0], positional[1:]
+}
+
+// isCommandPath reports whether an argument is written as a path rather than as
+// an image reference.
+func isCommandPath(arg string) bool {
+	return strings.HasPrefix(arg, "/") ||
+		strings.HasPrefix(arg, "./") ||
+		strings.HasPrefix(arg, "../")
+}
+
 // parseRunSpec turns `forge run` arguments into a Spec.
 //
 // It is separate from execRun so the whole of the CLI's actual work — mapping
@@ -174,10 +214,12 @@ func parseRunSpec(args []string) (runtime.Spec, error) {
 		return runtime.Spec{}, err
 	}
 
-	command := fs.Args()
-	if len(command) == 0 {
+	positional := fs.Args()
+	if len(positional) == 0 {
 		return runtime.Spec{}, errNoCommandGiven
 	}
+
+	imageRef, command := splitImageAndCommand(local.rootfs, positional)
 
 	limits, err := parseLimits(local)
 	if err != nil {
@@ -186,6 +228,7 @@ func parseRunSpec(args []string) (runtime.Spec, error) {
 
 	spec := runtime.Spec{
 		Command:      command,
+		Image:        imageRef,
 		Hostname:     local.hostname,
 		Rootfs:       local.rootfs,
 		Mounts:       local.mounts,
@@ -222,11 +265,20 @@ func execRun(ctx context.Context, env *Env, args []string) error {
 	}
 
 	spec.Stdin, spec.Stdout, spec.Stderr = env.Stdin, env.Stdout, env.Stderr
-	// Stage 2 runs a binary from a root filesystem that carries no image
-	// config, so the container's environment is still minimal and explicit.
-	spec.Env = defaultContainerEnv()
 
-	runner, err := runtime.NewRunner(env.Logger, runtime.Config{Root: env.Opts.Root})
+	// A container with no image has no environment to inherit, so Forge
+	// supplies the minimal explicit one Stages 1 to 4 have always used. A
+	// container *with* an image gets the image's, merged by the runtime — which
+	// is the only place that knows what the image declared, and so the only
+	// place that can decide (SSOT §2, §13.6).
+	if spec.Image == "" {
+		spec.Env = defaultContainerEnv()
+	}
+
+	runner, err := runtime.NewRunner(env.Logger, runtime.Config{
+		Root:      env.Opts.Root,
+		ImageRoot: env.Opts.ImageRoot,
+	})
 	if err != nil {
 		return err
 	}
@@ -280,6 +332,23 @@ func isUserError(err error) bool {
 		rootfs.ErrSourceNotFound,
 		rootfs.ErrSourceNotADirectory,
 		rootfs.ErrSourceIsHostRoot,
+		runtime.ErrImageAndRootfs,
+
+		// The image sentinels that are the caller's fault: a reference that is
+		// malformed, one that names nothing, one that needs credentials Forge
+		// does not have, and one with no build for this machine. Each of them
+		// is answered by typing something different.
+		//
+		// Deliberately absent, for the same reason the cgroup and network
+		// environment sentinels are: ErrRegistryUnavailable is a registry that
+		// is down, and ErrDigestMismatch, ErrCorruptLayer and ErrEscapesRoot are
+		// bad content. None of those is something the user typed wrong, and
+		// reporting them as usage errors would send them looking at their
+		// command line instead of at their network or their image.
+		image.ErrInvalidReference,
+		image.ErrNotFound,
+		image.ErrUnauthorized,
+		image.ErrNoMatchingPlatform,
 	} {
 		if errors.Is(err, sentinel) {
 			return true
@@ -288,24 +357,36 @@ func isUserError(err error) bool {
 	return false
 }
 
-// defaultContainerEnv is the environment Forge gives a container.
+// defaultContainerEnv is the environment Forge gives a container that has no
+// image to take one from.
 //
-// It is deliberately minimal and explicit: nothing is inherited from the host.
-// PATH is included because almost every program expects one to exist.
+// The value itself belongs to the runtime, which also uses it as the fallback
+// for an image that declares no environment of its own. Two definitions of "the
+// default environment" would be exactly the kind of divergence SSOT §13.6
+// exists to prevent.
 func defaultContainerEnv() []string {
-	return []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-	}
+	return runtime.DefaultEnv()
 }
 
 // writeRunUsage prints help for `forge run`.
 func writeRunUsage(w io.Writer) {
-	fmt.Fprint(w, "Usage:\n  forge run [flags] <path> [args...]\n\n")
-	fmt.Fprint(w, "Runs <path> as PID 1 inside new PID, UTS and mount namespaces.\n")
-	fmt.Fprint(w, "<path> is resolved inside the container; forge does not search PATH.\n\n")
-	fmt.Fprint(w, "Without -rootfs the container shares the host's filesystem. With it, the\n")
-	fmt.Fprint(w, "container gets its own root filesystem via pivot_root, and host directories\n")
-	fmt.Fprint(w, "can be bind-mounted in with -mount.\n\n")
+	fmt.Fprint(w, "Usage:\n")
+	fmt.Fprint(w, "  forge run [flags] <image> [cmd] [args...]\n")
+	fmt.Fprint(w, "  forge run [flags] -rootfs <dir> <path> [args...]\n")
+	fmt.Fprint(w, "  forge run [flags] <path> [args...]\n\n")
+	fmt.Fprint(w, "Runs a command as PID 1 inside new PID, UTS, mount and network namespaces.\n\n")
+	fmt.Fprint(w, "The first argument is an image reference, such as alpine:3.20, unless it\n")
+	fmt.Fprint(w, "begins with / ./ or ../ or -rootfs was given, in which case it is the\n")
+	fmt.Fprint(w, "command. Forge pulls the image, verifies every layer against its digest,\n")
+	fmt.Fprint(w, "caches it under -image-root, and unpacks it into the container's own root\n")
+	fmt.Fprint(w, "filesystem. With no command, the image's entrypoint and cmd are used;\n")
+	fmt.Fprint(w, "arguments given here replace its cmd and keep its entrypoint.\n\n")
+	fmt.Fprint(w, "A bare command name is resolved against the container's own PATH, but only\n")
+	fmt.Fprint(w, "when running from an image. Without one forge does not search PATH at all —\n")
+	fmt.Fprint(w, "there would be no filesystem to search but the host's — so give a <path>.\n\n")
+	fmt.Fprint(w, "Without an image and without -rootfs the container shares the host's\n")
+	fmt.Fprint(w, "filesystem. With either, it gets its own root filesystem via pivot_root, and\n")
+	fmt.Fprint(w, "host directories can be bind-mounted in with -mount.\n\n")
 	fmt.Fprint(w, "Every container gets a cgroup v2 leaf for accounting. -memory, -cpus,\n")
 	fmt.Fprint(w, "-cpu-weight and -pids constrain it; a limit left unset is inherited rather\n")
 	fmt.Fprint(w, "than capped. Pass \"max\" to ask for no limit explicitly.\n\n")
@@ -320,6 +401,9 @@ func writeRunUsage(w io.Writer) {
 	fs.PrintDefaults()
 
 	fmt.Fprint(w, "\nExamples:\n")
+	fmt.Fprint(w, "  sudo forge run alpine:3.20\n")
+	fmt.Fprint(w, "  sudo forge run alpine:3.20 ls /etc\n")
+	fmt.Fprint(w, "  sudo forge run -memory 128m ghcr.io/org/image:latest /bin/sh\n")
 	fmt.Fprint(w, "  sudo forge run /bin/echo hello from forge\n")
 	fmt.Fprint(w, "  sudo forge run -rootfs /srv/alpine /bin/sh\n")
 	fmt.Fprint(w, "  sudo forge run -rootfs /srv/alpine -mount /srv/data:/data:ro /bin/ls /data\n")

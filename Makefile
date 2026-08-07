@@ -14,7 +14,10 @@ test: ## Run unit tests (no root required)
 
 .PHONY: test-integration
 test-integration: ## Run privileged integration tests (requires root, Linux)
-	$(GO) test -tags integration -count=1 ./test/integration/...
+	# Stage 5 pulls real images from a real registry, so the budget has to cover
+	# a slow uplink as well as the kernel work. The default 10m was sized for a
+	# suite that touched no network.
+	$(GO) test -tags integration -count=1 -timeout 30m ./test/integration/...
 
 .PHONY: cover
 cover: ## Report unit-test coverage

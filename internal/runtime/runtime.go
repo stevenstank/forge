@@ -3,39 +3,55 @@
 //
 // Per SSOT §13.2 it is the only orchestrator: the primitive packages never call
 // one another, and every cross-package sequencing decision lives here. As of
-// Stage 4 it composes six — internal/namespace, internal/process,
-// internal/rootfs, internal/mount, internal/cgroup and internal/network.
+// Stage 5 it composes seven — internal/namespace, internal/process,
+// internal/rootfs, internal/mount, internal/cgroup, internal/network and
+// internal/image.
 //
 // # The lifecycle
 //
-// Every container follows the same ten steps, and the order of the first eight
-// is forced rather than chosen. Each column says what makes the step impossible
-// any earlier.
+// Every container follows the same twelve steps, and the order is forced rather
+// than chosen. Each column says what makes the step impossible any earlier.
 //
-//	 1  prepare filesystem   parent    the container directory and mount plan
-//	 2  prepare cgroup       parent    limits written before anything can join
-//	 3  prepare network      parent    bridge, NAT and an address; no container
+//	 1  resolve reference    parent    parse the image name; pure, no I/O
+//	 2  fetch manifest       parent    resolve the tag to an immutable digest
+//	 3  download layers      parent    only what the blob cache is missing
+//	 4  verify digests       parent    on the wire, on the write, and at use
+//	 -- nothing on the host has been created; the cleanup stack is empty ------
+//	 5  construct rootfs     parent    the container directory, and the image's
+//	                                   layers unpacked into it, base first
+//	 6  prepare filesystem   parent    the mount plan its init will apply
+//	 7  prepare cgroup       parent    limits written before anything can join
+//	 8  prepare network      parent    bridge, NAT and an address; no container
 //	                                   needed, so it is claimed before there is
 //	                                   one to leak it
 //	 -- clone(2) ------------------------------------------------------------
-//	 4  start process        parent    the namespaces exist; the child blocks
+//	 9  start process        parent    the namespaces exist; the child blocks
 //	                                   on the payload pipe and does nothing
-//	 5  attach pid           parent    cgroup.procs needs a pid, and a pid needs
-//	                                   clone(2) to have returned
-//	 6  move interface       parent    a netns can only be named by the pid of
-//	                                   a process already inside it
-//	 7  configure host side  parent    the host veth is enslaved to the bridge
-//	                                   and brought up
-//	 8  send payload         parent    releases the child, which configures its
-//	                                   own interface, mounts, pivots and execs
-//	 9  wait                 parent    supervise until the container exits
-//	10  cleanup              parent    unwind the stack, in reverse
+//	                                   — and in the same window: attach the pid
+//	                                   to the cgroup, move the interface into
+//	                                   the namespace, plug the host end in
+//	10  send payload         parent    releases the child, which configures its
+//	                                   own interface, mounts, pivots, resolves
+//	                                   the command and execs
+//	11  wait                 parent    supervise until the container exits
+//	12  cleanup              parent    unwind the stack, in reverse
 //
-// Steps 5 to 7 all happen inside the window step 4 opens: the child's first act
-// is a blocking read (ADR-0008), so it cannot run a single instruction of the
-// container's own binary until step 8. Everything a container must be born with
-// — its limits, its interface — is therefore in place before it, rather than
-// racing it.
+// Steps 1 to 4 come first because they are the only ones that create nothing.
+// They touch the network and the shared blob cache, so every way they can fail
+// — a name that does not parse, a registry that is down, a platform that is not
+// published, a layer that does not verify — leaves the host bit-for-bit
+// unchanged, with no directory to remove and no address to release. A typo in
+// an image name is the commonest failure in the whole stage, and it costs
+// nothing.
+//
+// The three sub-steps folded into step 9 all happen inside the window it opens:
+// the child's first act is a blocking read (ADR-0008), so it cannot run a single
+// instruction of the container's own binary until step 10. Everything a
+// container must be born with — its limits, its interface — is therefore in
+// place before it, rather than racing it.
+//
+// A container with no image skips steps 1 to 4 entirely and enters at step 5,
+// which is why every Stage 1 to 4 container behaves exactly as it did.
 //
 // # How a container starts
 //
@@ -100,6 +116,7 @@ import (
 	"syscall"
 
 	"github.com/stevenstank/forge/internal/cgroup"
+	"github.com/stevenstank/forge/internal/image"
 	"github.com/stevenstank/forge/internal/mount"
 	"github.com/stevenstank/forge/internal/namespace"
 	"github.com/stevenstank/forge/internal/network"
@@ -122,6 +139,22 @@ type Config struct {
 	// from the --root flag (SSOT §9).
 	Root string
 
+	// ImageRoot is the directory downloaded layers are cached in, from the
+	// --image-root flag. Empty means DefaultImageRoot.
+	//
+	// It is independent of Root so the two can sit on different filesystems.
+	// Nothing is created here unless a container is actually run from an image.
+	ImageRoot string
+
+	// Registry configures the OCI Distribution client: timeouts, retry policy,
+	// the manifest size cap. The zero value takes internal/image's defaults,
+	// which is the production configuration.
+	//
+	// It is a struct rather than flattened fields because it is passed through
+	// verbatim: the runtime decides *which* image to pull, never how long a
+	// registry may take to answer.
+	Registry image.ClientConfig
+
 	// CgroupRoot is the mount point of the cgroup v2 unified hierarchy.
 	// Empty means cgroup.DefaultRoot, which is where every distribution
 	// mounts it; it exists so tests can point the runtime at a directory of
@@ -143,9 +176,25 @@ type Config struct {
 // intent; this package reads no flags, environment, or global state.
 type Spec struct {
 	// Command is the argument vector to execute inside the container.
-	// Command[0] is the path to the binary, resolved inside the container's
-	// root filesystem.
+	//
+	// Command[0] is normally a path, resolved inside the container's root
+	// filesystem. With an Image it may also be a bare name, which is resolved
+	// against the container's own PATH by the container's init, after the pivot
+	// — the only process that can see the filesystem being searched.
+	//
+	// Empty is valid only with an Image, which then supplies the command from
+	// its Entrypoint and Cmd. Arguments given here replace the image's Cmd and
+	// keep its Entrypoint, as Docker does.
 	Command []string
+
+	// Image is an OCI image reference such as "alpine:3.20" to run the
+	// container from. Forge pulls it, verifies it, and unpacks its layers into
+	// the container's own root filesystem directory.
+	//
+	// Mutually exclusive with Rootfs: they are two answers to the same
+	// question, and a caller who gave both more likely made a mistake than a
+	// choice.
+	Image string
 
 	// Env is the container's complete environment. Nil means an empty
 	// environment: nothing is inherited from the host implicitly.
@@ -161,15 +210,16 @@ type Spec struct {
 	Rootfs string
 
 	// Mounts are bind mounts to make inside the container, in addition to the
-	// default set every container gets. Requires Rootfs.
+	// default set every container gets. Requires Rootfs or Image.
 	Mounts []mount.Mount
 
 	// ReadonlyRoot mounts the container's root filesystem read-only. Requires
-	// Rootfs.
+	// Rootfs or Image.
 	ReadonlyRoot bool
 
 	// WorkingDir is the directory the container's binary starts in, inside the
-	// container. Empty means "/". Requires Rootfs.
+	// container. Empty means the image's, or "/" if it declares none. Requires
+	// Rootfs or Image.
 	WorkingDir string
 
 	// Limits are the container's resource limits. The zero value asks for
@@ -202,15 +252,12 @@ type Spec struct {
 // Validate reports whether the spec can be run. It is pure and performs no
 // syscalls, so bad input is rejected before anything is forked.
 func (s Spec) Validate() error {
-	if len(s.Command) == 0 || s.Command[0] == "" {
-		return ErrNoCommand
+	if err := s.validateImage(); err != nil {
+		return err
 	}
-	// Forge resolves the command inside the container, and a container has no
-	// PATH of its own until images arrive in Stage 5. A bare name would be
-	// resolved against the *host's* PATH — a surprise worth refusing outright.
-	if !strings.Contains(s.Command[0], "/") {
-		return fmt.Errorf("%w: %q is not a path; forge does not search PATH, give a path inside the container such as /bin/%s",
-			ErrNotAPath, s.Command[0], s.Command[0])
+
+	if err := s.validateCommand(); err != nil {
+		return err
 	}
 
 	if s.Hostname != "" {
@@ -236,23 +283,71 @@ func (s Spec) Validate() error {
 	return s.Limits.Validate()
 }
 
+// validateImage checks the Stage 5 half of the spec. It is pure: ParseReference
+// performs no I/O, so a malformed reference is a usage error reported before
+// anything is forked or any socket is opened.
+func (s Spec) validateImage() error {
+	if s.Image == "" {
+		return nil
+	}
+	if s.Rootfs != "" {
+		return fmt.Errorf("%w: %q and --rootfs %q are two answers to the same question",
+			ErrImageAndRootfs, s.Image, s.Rootfs)
+	}
+
+	_, err := image.ParseReference(s.Image)
+	return err
+}
+
+// validateCommand checks that there is something to run, and that Forge will be
+// able to find it.
+//
+// The PATH rule narrowed in Stage 5 rather than disappearing, and the asymmetry
+// is the honest one: searching a PATH is safe exactly when Forge knows which
+// filesystem it is searching.
+//
+//   - With an image there is finally a PATH that means something inside the
+//     container, so a bare name is accepted and resolved child-side, after the
+//     pivot, by the only process that can see that filesystem.
+//   - Without one, a bare name would be resolved against the *host's* PATH,
+//     which is a surprise worth refusing outright. That is Stage 1's rule and it
+//     is unchanged.
+func (s Spec) validateCommand() error {
+	if len(s.Command) == 0 || s.Command[0] == "" {
+		if s.Image == "" {
+			return ErrNoCommand
+		}
+		// An image may supply the command from its entrypoint and cmd. Whether
+		// it actually does is only knowable after the pull, so it is checked in
+		// containerImage.apply rather than guessed at here.
+		return nil
+	}
+
+	if !strings.Contains(s.Command[0], "/") && s.Image == "" {
+		return fmt.Errorf("%w: %q is not a path; without an image forge does not search PATH, give a path inside the container such as /bin/%s",
+			ErrNotAPath, s.Command[0], s.Command[0])
+	}
+
+	return nil
+}
+
 // validateFilesystem checks the Stage 2 half of the spec.
 func (s Spec) validateFilesystem() error {
-	if s.Rootfs == "" {
+	if s.Rootfs == "" && s.Image == "" {
 		// Every filesystem option needs something to apply to. Accepting them
 		// silently would produce a container that ignored them.
 		switch {
 		case len(s.Mounts) > 0:
-			return fmt.Errorf("%w: --mount needs a --rootfs to mount into", ErrMountWithoutRootfs)
+			return fmt.Errorf("%w: --mount needs an image or a --rootfs to mount into", ErrMountWithoutRootfs)
 		case s.ReadonlyRoot:
-			return fmt.Errorf("%w: --read-only needs a --rootfs to make read-only", ErrMountWithoutRootfs)
+			return fmt.Errorf("%w: --read-only needs an image or a --rootfs to make read-only", ErrMountWithoutRootfs)
 		case s.WorkingDir != "":
-			return fmt.Errorf("%w: --workdir needs a --rootfs to resolve it in", ErrMountWithoutRootfs)
+			return fmt.Errorf("%w: --workdir needs an image or a --rootfs to resolve it in", ErrMountWithoutRootfs)
 		}
 		return nil
 	}
 
-	if !filepath.IsAbs(s.Rootfs) {
+	if s.Rootfs != "" && !filepath.IsAbs(s.Rootfs) {
 		return fmt.Errorf("%w: --rootfs %q must be an absolute path", ErrRootfsNotAbsolute, s.Rootfs)
 	}
 	if s.WorkingDir != "" && !filepath.IsAbs(s.WorkingDir) {
@@ -263,8 +358,17 @@ func (s Spec) validateFilesystem() error {
 	// The plan the mounts end up in is validated as a whole once the container
 	// directory is known; this catches what can be known now, in the parent,
 	// before anything is created.
+	//
+	// With an image the source is the container's own root filesystem — the
+	// self-bind ADR-0010 anticipated — and that directory does not exist yet,
+	// so a placeholder stands in for it. Only the mounts are being judged here.
+	source := s.Rootfs
+	if source == "" {
+		source = filepath.Join(string(filepath.Separator), "placeholder-source")
+	}
+
 	return mount.Plan{
-		Source: s.Rootfs,
+		Source: source,
 		Root:   filepath.Join(string(filepath.Separator), "placeholder"),
 		Mounts: s.Mounts,
 	}.Validate()
@@ -343,6 +447,21 @@ var (
 	// ErrInvalidMTU reports an MTU the kernel would refuse.
 	ErrInvalidMTU = errors.New("invalid MTU")
 
+	// ErrImageAndRootfs reports a spec naming both an image and a host
+	// directory to use as the container's root filesystem.
+	ErrImageAndRootfs = errors.New("an image and a root filesystem cannot both be given")
+
+	// ErrCommandNotFound reports a bare command name that no directory on the
+	// container's PATH provides. It is returned by the container's init, after
+	// the pivot, because that is the only process that can see the filesystem
+	// being searched.
+	ErrCommandNotFound = errors.New("command not found in the container")
+
+	// ErrPathSearchWithoutRootfs reports an init payload asking for a PATH
+	// search in a container that has no filesystem of its own. The search would
+	// run against the host's directories, which is never what was meant.
+	ErrPathSearchWithoutRootfs = errors.New("a bare command name needs a container filesystem to resolve against")
+
 	// ErrNetworkWithoutNetns reports an init payload carrying an interface for
 	// a container that has no network namespace to configure. Applying it
 	// would reconfigure the host.
@@ -355,6 +474,8 @@ type Runner struct {
 	store    *rootfs.Store
 	cgroups  *cgroup.Manager
 	networks *network.Manager
+	images   *image.Cache
+	registry *image.Client
 }
 
 // NewRunner returns a Runner that logs through logger and stores container root
@@ -363,12 +484,14 @@ type Runner struct {
 // The logger is injected rather than global so every container operation can be
 // correlated by the container_id attribute this package attaches (SSOT §6).
 //
-// Constructing the cgroup and network managers touches nothing: whether the
-// host has a usable cgroup v2 hierarchy or a usable bridge depends on what a
-// container asks for, so both are decided per container — in prepareCgroup and
-// prepareNetwork — where they can be reported against that container. The only
-// thing that can fail here is a network configuration that is wrong on its
-// face, such as an unparseable subnet.
+// Constructing the cgroup, network, image and registry components touches
+// nothing: whether the host has a usable cgroup v2 hierarchy or a usable bridge
+// depends on what a container asks for, so both are decided per container — in
+// prepareCgroup and prepareNetwork — where they can be reported against that
+// container. The image cache does not even create its directories, so a runner
+// that is only ever used with --rootfs leaves no cache behind. The only things
+// that can fail here are configurations that are wrong on their face, such as
+// an unparseable subnet or a relative cache root.
 func NewRunner(logger *slog.Logger, cfg Config) (*Runner, error) {
 	store, err := rootfs.NewStore(cfg.Root, logger)
 	if err != nil {
@@ -380,11 +503,27 @@ func NewRunner(logger *slog.Logger, cfg Config) (*Runner, error) {
 		return nil, err
 	}
 
+	imageRoot := cfg.ImageRoot
+	if imageRoot == "" {
+		imageRoot = DefaultImageRoot
+	}
+	images, err := image.NewCache(imageRoot, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	registry, err := image.New(logger, cfg.Registry)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Runner{
 		logger:   logger,
 		store:    store,
 		cgroups:  cgroup.New(cfg.CgroupRoot),
 		networks: networks,
+		images:   images,
+		registry: registry,
 	}, nil
 }
 
@@ -417,7 +556,27 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	cleanup := newCleanupStack(log)
 	defer cleanup.unwind()
 
-	plan, err := r.prepareFilesystem(ctx, log, id, spec, cleanup)
+	// Steps 1 to 4, and they happen before the stack has a single entry on it.
+	// The image is resolved, downloaded and verified while the only things
+	// Forge has touched are the network and the shared blob cache — so every
+	// way this can fail leaves the host unchanged, with no directory to remove
+	// and no address to release (see image.go).
+	img, err := r.resolveImage(ctx, log, spec)
+	if err != nil {
+		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
+	}
+	if img != nil {
+		// The image's command, environment and working directory become the
+		// spec's defaults. This is the last change to the spec, and it happens
+		// before anything is created, so what is built below is what will run.
+		if spec, err = img.apply(spec); err != nil {
+			return process.Status{}, fmt.Errorf("container %s: %w", id, err)
+		}
+	}
+
+	// Steps 5 and 6: the container's directory, its contents unpacked from the
+	// image, and the plan describing what its init will mount.
+	plan, err := r.prepareFilesystem(ctx, log, id, spec, img, cleanup)
 	if err != nil {
 		return process.Status{}, fmt.Errorf("container %s: %w", id, err)
 	}
@@ -487,28 +646,44 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (process.Status, error) {
 	return status, nil
 }
 
-// prepareFilesystem creates the container's root filesystem directory and the
-// plan describing what the container's init will mount into it.
+// prepareFilesystem creates the container's root filesystem directory, fills it
+// if the container came from an image, and builds the plan describing what the
+// container's init will mount into it.
 //
-// A spec with no Rootfs returns a nil plan, which is what keeps a Stage 1
-// container running against the host's filesystem: nothing is created, nothing
-// is mounted, and no pivot happens.
+// A spec with neither Rootfs nor Image returns a nil plan, which is what keeps a
+// Stage 1 container running against the host's filesystem: nothing is created,
+// nothing is mounted, and no pivot happens.
+//
+// The two sources of content are mutually exclusive and converge here:
+//
+//	--rootfs <dir>   the directory is bind-mounted over the container's root
+//	                 by its init, inside the mount namespace (Stage 2)
+//	an image         the layers are unpacked into the container's root here,
+//	                 in the parent, and the init self-binds it to satisfy
+//	                 pivot_root's mount-point precondition (ADR-0010)
+//
+// Either way internal/rootfs owns the directory and internal/image owns the
+// bytes in it. The sequencing between them is this function's, which is the
+// whole of why ADR-0020 needs no edge between those two packages.
 func (r *Runner) prepareFilesystem(
 	ctx context.Context,
 	log *slog.Logger,
 	id string,
 	spec Spec,
+	img *containerImage,
 	cleanup *cleanupStack,
 ) (*mount.Plan, error) {
-	if spec.Rootfs == "" {
+	if spec.Rootfs == "" && img == nil {
 		return nil, nil
 	}
 
-	source, err := rootfs.ValidateSource(spec.Rootfs)
-	if err != nil {
-		return nil, err
+	if img == nil {
+		source, err := rootfs.ValidateSource(spec.Rootfs)
+		if err != nil {
+			return nil, err
+		}
+		spec.Rootfs = source // a copy; the caller's spec is untouched
 	}
-	spec.Rootfs = source // a copy; the caller's spec is untouched
 
 	dir, err := r.store.Prepare(id)
 	if err != nil {
@@ -530,6 +705,34 @@ func (r *Runner) prepareFilesystem(
 		}
 		return r.store.Remove(ctx, id)
 	})
+
+	// Step 5, and it is deliberately the first thing after the cleanup that
+	// removes what it writes. Extraction is the only part of a run that puts
+	// files inside a container's directory, so there must be no window in which
+	// those files exist and nothing is responsible for them: a layer that fails
+	// half-way through, a full disk, a cancelled context — all of them unwind
+	// through the push above (FR-5.3, PRD §10.4).
+	if img != nil {
+		stats, err := image.BuildRootfs(ctx, r.images, img.manifest.Layers, dir.Rootfs)
+		if err != nil {
+			return nil, err
+		}
+
+		// The source of the bind is the container's own root filesystem. That
+		// self-bind does one job and one only: pivot_root(2) requires its new
+		// root to be a mount point, and after unpacking this directory is an
+		// ordinary directory (ADR-0001, ADR-0010).
+		spec.Rootfs = dir.Rootfs
+
+		log.Info("unpacked image layers",
+			"reference", img.ref.String(), "layers", len(img.manifest.Layers),
+			"files", stats.Files, "dirs", stats.Dirs, "bytes", stats.Bytes)
+
+		if stats.UnownedEntries > 0 {
+			log.Warn("some unpacked files could not be given their image ownership",
+				"entries", stats.UnownedEntries)
+		}
+	}
 
 	plan, err := mountPlan(spec, dir)
 	if err != nil {
@@ -614,6 +817,7 @@ func (r *Runner) start(
 	// own binary runs.
 	if cgroupID != "" {
 		if err := r.cgroups.Add(cgroupID, p.PID()); err != nil {
+			closeFile(log, payloadWriter, "init payload writer")
 			r.abandon(ctx, log, p, "a failed cgroup attach")
 			return process.Status{}, err
 		}
@@ -630,6 +834,7 @@ func (r *Runner) start(
 	// that prepareNetwork already registered, which is idempotent and covers
 	// every intermediate state this can fail in (SSOT §11.3, §13.3).
 	if err := r.attachNetwork(log, cnet, p.PID()); err != nil {
+		closeFile(log, payloadWriter, "init payload writer")
 		r.abandon(ctx, log, p, "a failed network attach")
 		return process.Status{}, err
 	}

@@ -56,7 +56,12 @@ func TestMain(m *testing.M) {
 
 	mode := os.Getenv(helperEnv)
 	if mode == "" {
-		os.Exit(m.Run())
+		code := m.Run()
+		// Stage 5 keeps one blob cache for the whole run so a real image is
+		// pulled once rather than once per test. This is the only moment at
+		// which no test can still be reading from it.
+		stage5CleanupSharedCache()
+		os.Exit(code)
 	}
 
 	for _, dispatch := range []func(string) (int, bool){stage1Helper, stage2Helper, stage3Helper, stage4Helper} {

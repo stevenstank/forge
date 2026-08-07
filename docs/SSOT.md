@@ -57,12 +57,11 @@ consumer, prefer `internal/`.
 |---|---|---|
 | `internal/process` | Fork/exec the container's init process via `clone(2)`; manage its lifecycle (start, wait, signal, exit code) | Know about images, networking, or cgroups directly — receives fully-prepared config |
 | `internal/namespace` | Compute and apply `CloneFlags` for PID/UTS/mount/net namespaces; in-child namespace setup (`sethostname`, marking the mount tree `MS_REC\|MS_PRIVATE`); namespace-entry helpers (`setns`) for `forge exec` | Perform filesystem or network *configuration* — mounting filesystems, writing files, assigning addresses. Setting a namespace's mount *propagation* is namespace creation, not filesystem configuration: without it `CLONE_NEWNS` does not isolate (ADR-0008) |
-| `internal/rootfs` | Prepare a container's root filesystem directory; validate/own the rootfs path | Unpack OCI layers directly (delegates to `internal/image`) |
+| `internal/rootfs` | Prepare a container's root filesystem directory; validate/own the rootfs path | Unpack OCI layers, or know what an image is. It owns the *directory*; `internal/image` owns the *contents*, and `internal/runtime` sequences the two (ADR-0020) |
 | `internal/mount` | `pivot_root`, bind mounts, mount table cleanup | Decide *what* to mount — receives a mount plan from the caller |
 | `internal/cgroup` | Create/configure/destroy cgroup v2 leaves; write resource limits | Interpret CLI flags — receives a typed `ResourceLimits` struct |
 | `internal/network` | netns creation, veth pair creation, bridge attachment, IP allocation, NAT rules | Own container lifecycle — only owns networking resources for a given container ID |
-| `internal/image` | Unpack layer tarballs, assemble a rootfs from layers, layer cache management | Perform HTTP/registry communication (delegates to `internal/registry`) |
-| `internal/registry` | OCI Distribution Spec client: auth, manifest fetch, blob download | Know about local filesystem layout beyond writing raw blobs to a cache path |
+| `internal/image` | Everything between an image reference and a populated directory: reference parsing, the OCI Distribution Spec client (anonymous auth, manifest fetch, blob download), digest verification, the content-addressed blob cache, layer unpacking (ADR-0020) | Know what a container is — it is handed a destination directory and writes into it. Decide *which* image, *which* platform, or *where* the rootfs goes: those are `internal/runtime`'s |
 | `internal/runtime` | Orchestrate the above packages to implement container lifecycle (create, start, stop, exec, remove); the "conductor". Also owns container ID generation (§8) and `Init`, the container-side entry point Forge re-executes itself as (ADR-0008). First appears in **Stage 1** — orchestration has to live somewhere from the first stage, and §13.2 says it lives here (ADR-0007) — and grows through Stage 6 | Contain namespace/cgroup/mount syscall logic itself — always delegates |
 | `internal/state` | Persist and query container metadata (ID, PID, status, image, timestamps) on disk | Perform any kernel resource management |
 | `internal/cli` | Parse CLI args/flags, call into `internal/runtime`, format output | Contain business logic — CLI packages are intentionally "dumb" |
@@ -70,9 +69,11 @@ consumer, prefer `internal/`.
 
 **Dependency rule (strict, see §9):** `internal/runtime` may depend on every
 other `internal/*` package. No other package may depend on `internal/runtime`.
-Leaf packages (`process`, `namespace`, `mount`, `cgroup`, `network`, `image`,
-`registry`, `state`, `logging`) must not depend on each other except where
-explicitly noted above (`rootfs` → `image`).
+Leaf packages (`process`, `namespace`, `rootfs`, `mount`, `cgroup`, `network`,
+`image`, `state`, `logging`) must not depend on each other. There are no
+exceptions: the two this document previously allowed, `rootfs` → `image` and
+`image` → `registry`, were both retired by ADR-0020 when Stage 5 was
+implemented.
 
 ---
 
@@ -95,17 +96,17 @@ Forge follows a **layered, orchestrator-delegates-to-primitives** architecture:
                      └──┬───┬───┬───┘
            ┌────────────┘   │   └─────────────┐
            │                │                  │
-    ┌──────▼─────┐   ┌──────▼──────┐   ┌───────▼───────┐
-    │ namespace/  │   │  cgroup/    │   │   network/    │
-    │ process/    │   │             │   │               │
-    │ rootfs/     │   │             │   │               │
-    │ mount/      │   │             │   │               │
-    └─────────────┘   └─────────────┘   └───────────────┘
-           │
-    ┌──────▼──────┐
-    │   image/    │───▶ registry/
-    └─────────────┘
+    ┌──────▼─────┐   ┌──────▼──────┐   ┌───────▼───────┐   ┌──────▼──────┐
+    │ namespace/  │   │  cgroup/    │   │   network/    │   │   image/    │
+    │ process/    │   │             │   │               │   │             │
+    │ rootfs/     │   │             │   │               │   │             │
+    │ mount/      │   │             │   │               │   │             │
+    └─────────────┘   └─────────────┘   └───────────────┘   └─────────────┘
 ```
+
+Every primitive is a leaf, including `image`: it hangs off `runtime` beside the
+others rather than under `rootfs`, because `rootfs` owns a container's directory
+and `image` owns the bytes written into one (ADR-0020).
 
 Each primitive package wraps a specific kernel/OS mechanism and exposes a
 narrow, typed Go API. `internal/runtime` composes these into the container
@@ -119,8 +120,8 @@ creation.
    to a distinct Linux mechanism. This keeps the mapping from "concept" to
    "code" obvious for learners.
 2. **Orchestration is centralized.** All cross-package sequencing lives in
-   `internal/runtime`. Primitive packages never call each other directly
-   except the documented `rootfs → image` dependency.
+   `internal/runtime`. Primitive packages never call each other directly —
+   without exception, since ADR-0020.
 3. **Config in, resource out.** Every primitive package takes a fully-formed
    configuration struct and returns a handle/resource (or error). No package
    reads global state, environment variables, or CLI flags directly except
@@ -247,7 +248,9 @@ creation.
 - Root command: `forge`.
 - Global flags: `--log-level`, `--state-dir` (default
   `/var/lib/forge`), `--root` (rootfs storage root, default
-  `/var/lib/forge/containers`).
+  `/var/lib/forge/containers`), `--image-root` (blob cache root, default
+  `/var/lib/forge/images`, arrives with Stage 5's runtime integration). `--root`
+  and `--image-root` are independent so they can sit on different filesystems.
 - Subcommands (final set, delivered incrementally by stage):
   - `forge run [flags] <image|rootfs-path> [cmd] [args...]`
     - **Until Stage 5**, the root filesystem is named by a `-rootfs` *flag*
@@ -313,9 +316,11 @@ creation.
 ```
 CLI parses args
    → runtime.CreateContainer(ctx, Spec)
-       → image.Resolve(ref)            [if image ref, not local path]
-           → registry.Pull(ref)
-           → image.Unpack(layers) → rootfs path
+       → image.ParseReference(ref)     [if image ref, not local path]
+       → image.Client.Resolve(ctx, ref, platform)   → Manifest (digests verified)
+       → image.Pull(ctx, client, cache, repo, manifest)  → blobs cached by digest
+       → rootfs.Store.Prepare(containerID)          → <root>/<id>/rootfs
+       → image.BuildRootfs(ctx, cache, layers, dir) → layers applied in order
        → state.Create(containerID, metadata)   [status: created]
        → namespace.Prepare(Config{PID,UTS,Mount,Net})
        → cgroup.Create(containerID, ResourceLimits)
@@ -384,7 +389,7 @@ overriding them:
    implements primitives itself via direct syscalls (`golang.org/x/sys/unix`
    or raw syscalls) — this is the entire point of the project.
 2. **`internal/runtime` is the only orchestrator.** Primitive packages never
-   call each other (except the documented `rootfs → image` edge).
+   call each other. No exceptions (ADR-0020).
 3. **Every kernel resource Forge creates has a corresponding, idempotent
    teardown path**, exercised in tests.
 4. **No global mutable state, no package-level singletons holding runtime
@@ -446,7 +451,7 @@ What becomes easier or harder as a result?
 |---|---|---|
 | 0001 | Use `pivot_root` instead of `chroot` for rootfs isolation | Accepted |
 | 0002 | Use direct cgroups v2 filesystem writes instead of a cgroups library | Proposed |
-| 0003 | Layer assembly strategy: OverlayFS vs. explicit layer extraction | Proposed |
+| 0003 | Layer assembly strategy: OverlayFS vs. explicit layer extraction | Accepted |
 | 0004 | CLI flag library choice (stdlib `flag` vs. `cobra`) | Accepted |
 | 0005 | Container ID generation scheme | Accepted |
 | 0006 | State store format (JSON files vs. embedded DB) | Proposed |
@@ -457,9 +462,19 @@ What becomes easier or harder as a result?
 | 0011 | The mount plan is built by `runtime` and executed by `mount` | Accepted |
 | 0012 | All container mounts are made child-side, before `pivot_root` | Accepted |
 | 0013 | Depend on `golang.org/x/sys/unix` for syscalls | Accepted |
+| 0020 | One `internal/image` package, and no primitive-to-primitive edges | Accepted |
+| 0021 | The layer cache is a content-addressed blob store | Accepted |
+| 0022 | `forge run` positional grammar and command resolution from an image | Proposed |
 
 Each must be filled in and marked `Accepted` before the corresponding stage's
 implementation is merged.
+
+IDs 0014–0019 are unallocated. Stages 3 and 4 were merged without recording
+ADRs, and their decisions are documented in `docs/stages/` only; the numbers are
+left free so those records can be written retroactively without renumbering.
+0022 stays `Proposed` until `forge run <image>` is wired through
+`internal/runtime` and `internal/cli`, which Stage 5's package work deliberately
+leaves for a following change.
 
 ---
 

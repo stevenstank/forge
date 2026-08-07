@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/stevenstank/forge/internal/mount"
@@ -147,8 +149,16 @@ func Init() error {
 		return err
 	}
 
-	if err := syscall.Exec(payload.Command[0], payload.Command, payload.Env); err != nil {
-		return fmt.Errorf("executing %s: %w", payload.Command[0], err)
+	// Resolved here, and nowhere earlier, because "here" is after the pivot:
+	// this is the first moment any process can see the filesystem being
+	// searched. See resolveCommand.
+	path, err := resolveCommand(payload.Command[0], payload.Env)
+	if err != nil {
+		return err
+	}
+
+	if err := syscall.Exec(path, payload.Command, payload.Env); err != nil {
+		return fmt.Errorf("executing %s: %w", path, err)
 	}
 
 	// Unreachable: a successful execve never returns.
@@ -176,6 +186,77 @@ func configureNetwork(payload initPayload) error {
 		// must configure nothing at all.
 		return nil
 	}
+}
+
+// resolveCommand turns the command name into the path execve is given.
+//
+// A name containing a separator is already a path and is returned untouched —
+// that is every Stage 1 to 4 container, and their behaviour is unchanged.
+//
+// A bare name is searched for on the container's own PATH, which Stage 5 makes
+// possible because an image finally supplies one that means something. Three
+// things make the search safe, and all three depend on where it happens:
+//
+//   - It runs after pivot_root, so every directory it looks in is a directory
+//     inside the container. There is no host path it could reach.
+//   - It runs in the child, the only process whose "/" is the container's.
+//     A parent doing this would be searching its own filesystem and guessing.
+//   - The PATH it reads is the container's environment, which came from the
+//     image, not from the host's.
+//
+// A name that resolves to nothing names the PATH that was searched. "not found"
+// without saying where is the least useful error a container runtime can give.
+func resolveCommand(name string, env []string) (string, error) {
+	if strings.Contains(name, "/") {
+		return name, nil
+	}
+
+	search := pathFromEnv(env)
+	if len(search) == 0 {
+		return "", fmt.Errorf("%w: %q is not a path and the container has no PATH to search",
+			ErrCommandNotFound, name)
+	}
+
+	for _, dir := range search {
+		candidate := filepath.Join(dir, name)
+
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+			continue
+		}
+
+		return candidate, nil
+	}
+
+	return "", fmt.Errorf("%w: %q is not in any of %s",
+		ErrCommandNotFound, name, strings.Join(search, ", "))
+}
+
+// pathFromEnv extracts the PATH entries from an environment.
+//
+// The last assignment wins, matching what execve would hand the program: an
+// environment with two PATH entries is malformed, and disagreeing with the
+// kernel about which one counts would make the search find a different binary
+// than the container would.
+func pathFromEnv(env []string) []string {
+	var value string
+	for _, entry := range env {
+		if rest, ok := strings.CutPrefix(entry, "PATH="); ok {
+			value = rest
+		}
+	}
+
+	var dirs []string
+	for dir := range strings.SplitSeq(value, ":") {
+		// An empty element means "the current directory" to a shell. Searching
+		// it here would resolve a command against wherever -workdir left the
+		// process, which is not something a caller asked for.
+		if dir != "" {
+			dirs = append(dirs, dir)
+		}
+	}
+
+	return dirs
 }
 
 // enterWorkingDir moves the container's init into its working directory.
@@ -238,6 +319,15 @@ func decodeInitPayload(r io.Reader) (initPayload, error) {
 	}
 	if payload.Command[0] == "" {
 		return initPayload{}, ErrNoCommand
+	}
+	// A bare name is resolved against the container's PATH after the pivot. A
+	// payload with no mount plan never pivots, so that search would run over the
+	// host's directories and execve the host's binary. The parent's Validate
+	// refuses this already; re-checking here is the same defence in depth the
+	// mount plan and the interface below get, and for the same reason — this is
+	// the process that would act on it.
+	if !strings.Contains(payload.Command[0], "/") && payload.Mount == nil {
+		return initPayload{}, fmt.Errorf("%w: %q", ErrPathSearchWithoutRootfs, payload.Command[0])
 	}
 	// The parent validated this plan too. Validating it again here is not
 	// redundant: this is the process that would perform the mounts, and a

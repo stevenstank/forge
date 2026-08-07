@@ -1,9 +1,13 @@
 package cli
 
 import (
+	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/stevenstank/forge/internal/image"
 	"github.com/stevenstank/forge/internal/network"
 	"github.com/stevenstank/forge/internal/runtime"
 )
@@ -32,8 +36,12 @@ func TestRunCommandArgumentErrors(t *testing.T) {
 			wantStderr: "nonesuch",
 		},
 		{
-			name:       "bare name is not a path",
-			args:       []string{"run", "echo"},
+			// With -rootfs the positionals are the command, so a bare name is
+			// refused exactly as it was in Stages 2 to 4. Without -rootfs the
+			// same word would name an image, which is the new grammar and is
+			// covered in TestParseRunSpecGrammar.
+			name:       "bare name is not a path when the rootfs is a local directory",
+			args:       []string{"run", "-rootfs", "/srv/alpine", "echo"},
 			wantStderr: "does not search PATH",
 		},
 		{
@@ -92,6 +100,9 @@ func TestRunCommandHelp(t *testing.T) {
 	for _, want := range []string{
 		"forge run", "<path>", "-hostname", "does not search PATH",
 		"-rootfs", "-mount", "-read-only", "-workdir",
+		// Stage 5: the new positional form, and the rule that decides which
+		// grammar an invocation is using.
+		"<image>", "alpine:3.20", "-image-root",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("run help does not mention %q:\n%s", want, got)
@@ -371,5 +382,148 @@ func TestRunCommandStage4ArgumentErrors(t *testing.T) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr, tt.wantStderr)
 			}
 		})
+	}
+}
+
+// The Stage 5 positional grammar. `forge run` gained a positional <image> in
+// front of a command slot that has meant "the command" since Stage 1, so the
+// cases that matter are the ones where the two could be confused.
+func TestParseRunSpecGrammar(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		args        []string
+		wantImage   string
+		wantCommand []string
+	}{
+		{
+			name:        "an image and a command",
+			args:        []string{"alpine:3.20", "/bin/sh", "-c", "echo hi"},
+			wantImage:   "alpine:3.20",
+			wantCommand: []string{"/bin/sh", "-c", "echo hi"},
+		},
+		{
+			name:        "an image with no command, which the image supplies",
+			args:        []string{"alpine:3.20"},
+			wantImage:   "alpine:3.20",
+			wantCommand: nil,
+		},
+		{
+			name:        "an image and a bare command name",
+			args:        []string{"alpine", "ls"},
+			wantImage:   "alpine",
+			wantCommand: []string{"ls"},
+		},
+		{
+			name:        "a fully qualified reference is still an image, not a path",
+			args:        []string{"ghcr.io/org/image:v1", "ls"},
+			wantImage:   "ghcr.io/org/image:v1",
+			wantCommand: []string{"ls"},
+		},
+		{
+			// Stage 1, unchanged: a leading slash means a command.
+			name:        "an absolute path is a command",
+			args:        []string{"/bin/echo", "hello"},
+			wantImage:   "",
+			wantCommand: []string{"/bin/echo", "hello"},
+		},
+		{
+			name:        "a relative path is a command",
+			args:        []string{"./tool", "arg"},
+			wantImage:   "",
+			wantCommand: []string{"./tool", "arg"},
+		},
+		{
+			// Stages 2 to 4, unchanged: with -rootfs the positionals are the
+			// command, so a word that would otherwise read as an image is not
+			// one.
+			name:        "with -rootfs the first positional is the command",
+			args:        []string{"-rootfs", "/srv/alpine", "/bin/sh"},
+			wantImage:   "",
+			wantCommand: []string{"/bin/sh"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			spec, err := parseRunSpec(tt.args)
+			if err != nil {
+				t.Fatalf("parseRunSpec(%v) = %v", tt.args, err)
+			}
+			if spec.Image != tt.wantImage {
+				t.Errorf("Image = %q, want %q", spec.Image, tt.wantImage)
+			}
+			if !slices.Equal(spec.Command, tt.wantCommand) {
+				t.Errorf("Command = %v, want %v", spec.Command, tt.wantCommand)
+			}
+		})
+	}
+}
+
+// Flags keep working in front of an image reference, which is the arrangement
+// almost every invocation will use.
+func TestParseRunSpecFlagsBeforeAnImage(t *testing.T) {
+	t.Parallel()
+
+	spec, err := parseRunSpec([]string{"-memory", "128m", "-workdir", "/srv", "alpine:3.20", "ls"})
+	if err != nil {
+		t.Fatalf("parseRunSpec() = %v", err)
+	}
+
+	if spec.Image != "alpine:3.20" {
+		t.Errorf("Image = %q", spec.Image)
+	}
+	if !slices.Equal(spec.Command, []string{"ls"}) {
+		t.Errorf("Command = %v", spec.Command)
+	}
+	if spec.WorkingDir != "/srv" {
+		t.Errorf("WorkingDir = %q", spec.WorkingDir)
+	}
+	if spec.Limits.MemoryMax == nil || *spec.Limits.MemoryMax != 128*1024*1024 {
+		t.Errorf("MemoryMax = %v", spec.Limits.MemoryMax)
+	}
+}
+
+// A malformed reference is caught by parseRunSpec, before a runner exists, so
+// it exits 1 rather than reaching the runtime.
+func TestParseRunSpecRejectsAMalformedReference(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parseRunSpec([]string{"ALPINE:3.20"}); !errors.Is(err, image.ErrInvalidReference) {
+		t.Fatalf("parseRunSpec() = %v, want %v", err, image.ErrInvalidReference)
+	}
+}
+
+// The image sentinels a user can fix by typing something different exit 1; the
+// ones describing a broken network or a bad image do not.
+func TestIsUserErrorClassifiesImageFailures(t *testing.T) {
+	t.Parallel()
+
+	userErrors := []error{
+		image.ErrInvalidReference,
+		image.ErrNotFound,
+		image.ErrUnauthorized,
+		image.ErrNoMatchingPlatform,
+		runtime.ErrImageAndRootfs,
+	}
+	for _, err := range userErrors {
+		if !isUserError(fmt.Errorf("container abc: %w", err)) {
+			t.Errorf("isUserError(%v) = false, want true", err)
+		}
+	}
+
+	environmentErrors := []error{
+		image.ErrRegistryUnavailable,
+		image.ErrDigestMismatch,
+		image.ErrCorruptLayer,
+		image.ErrEscapesRoot,
+	}
+	for _, err := range environmentErrors {
+		if isUserError(fmt.Errorf("container abc: %w", err)) {
+			t.Errorf("isUserError(%v) = true, want false — this is not something the user typed", err)
+		}
 	}
 }

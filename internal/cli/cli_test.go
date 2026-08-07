@@ -133,13 +133,21 @@ func TestRunPassesGlobalOptionsToCommand(t *testing.T) {
 	}
 
 	a, _, stderr := newTestApp(cmd)
-	args := []string{"-log-level", "debug", "-state-dir", "/srv/forge/", "-root", "/srv/forge/rootfs", "noop"}
+	args := []string{
+		"-log-level", "debug", "-state-dir", "/srv/forge/",
+		"-root", "/srv/forge/rootfs", "-image-root", "/srv/forge/images/", "noop",
+	}
 
 	if code := a.run(t.Context(), args); code != ExitOK {
 		t.Fatalf("exit code = %d, want %d (stderr: %q)", code, ExitOK, stderr)
 	}
 
-	want := Options{LogLevel: slog.LevelDebug, StateDir: "/srv/forge", Root: "/srv/forge/rootfs"}
+	want := Options{
+		LogLevel:  slog.LevelDebug,
+		StateDir:  "/srv/forge",
+		Root:      "/srv/forge/rootfs",
+		ImageRoot: "/srv/forge/images",
+	}
 	if got != want {
 		t.Errorf("options = %+v, want %+v", got, want)
 	}
@@ -162,7 +170,12 @@ func TestRunDefaultOptions(t *testing.T) {
 		t.Fatalf("exit code = %d, want %d (stderr: %q)", code, ExitOK, stderr)
 	}
 
-	want := Options{LogLevel: slog.LevelInfo, StateDir: DefaultStateDir, Root: DefaultRoot}
+	want := Options{
+		LogLevel:  slog.LevelInfo,
+		StateDir:  DefaultStateDir,
+		Root:      DefaultRoot,
+		ImageRoot: DefaultImageRoot,
+	}
 	if got != want {
 		t.Errorf("options = %+v, want %+v", got, want)
 	}
