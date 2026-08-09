@@ -508,6 +508,53 @@ func TestStopWithRemove(t *testing.T) {
 	}
 }
 
+// TestStopWithRemoveToleratesAnAlreadyRemovedRecord is the race `forge stop
+// --rm` runs against every attached container that was not started with
+// --keep: the supervising run deletes the record as it unwinds, and the exit
+// that triggers that unwind is the same exit this stop is waiting for.
+//
+// The removal is staged from inside the signal, which is the deterministic
+// stand-in for the supervisor winning by a few microseconds. The stop asked
+// for a container to be gone and the container is gone, so it succeeds.
+func TestStopWithRemoveToleratesAnAlreadyRemovedRecord(t *testing.T) {
+	var (
+		r  *Runner
+		id = "7f3c9a1b2d04"
+	)
+
+	proc := &fakeProcess{alive: true, dieOn: syscall.SIGTERM}
+	r = testRunner(t, proc)
+	seed(t, r, runningRecord(id))
+
+	r.openProcess = func(int) (containerProcess, error) {
+		return &observingProcess{fakeProcess: proc, onSignal: func() {
+			// The supervisor reaping its container and taking the record with
+			// it, at the one moment that makes the stop observe it.
+			if err := r.state.Remove(id); err != nil {
+				t.Errorf("removing the record underneath the stop: %v", err)
+			}
+		}}, nil
+	}
+
+	if err := r.Stop(t.Context(), id, StopOptions{Remove: true}); err != nil {
+		t.Fatalf("Stop(--rm) = %v, want nil: the container is gone, which is what was asked", err)
+	}
+
+	if _, err := r.state.Load(id); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("Load after stop --rm = %v, want ErrNotFound", err)
+	}
+}
+
+// TestRemoveUnknownContainerIsStillAnError guards the other half of the rule
+// above: only the --rm path forgives a missing record.
+func TestRemoveUnknownContainerIsStillAnError(t *testing.T) {
+	r := testRunner(t, nil)
+
+	if err := r.Remove(t.Context(), "7f3c9a1b2d04", RemoveOptions{}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Remove() of an unknown container = %v, want ErrNotFound", err)
+	}
+}
+
 // TestRemoveRunningContainer is the refusal that gives `rm` its meaning:
 // deleting the filesystem of a container that is executing inside it does not
 // stop it, it corrupts it.

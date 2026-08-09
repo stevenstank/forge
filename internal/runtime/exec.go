@@ -9,6 +9,8 @@ import (
 	"os"
 	goruntime "runtime"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/stevenstank/forge/internal/namespace"
 	"github.com/stevenstank/forge/internal/process"
 	"github.com/stevenstank/forge/internal/state"
@@ -264,20 +266,9 @@ func (r *Runner) startInNamespaces(
 	handles []namespace.Handle,
 	cfg process.Config,
 ) (*process.Process, error) {
-	type outcome struct {
-		p   *process.Process
-		err error
-	}
-	done := make(chan outcome, 1)
-
-	go func() {
-		goruntime.LockOSThread()
-		// No UnlockOSThread, and no defer: see above. The thread dies with
-		// this goroutine.
-
+	res := onDisposableThread(func() execOutcome {
 		if err := namespace.Enter(handles); err != nil {
-			done <- outcome{err: err}
-			return
+			return execOutcome{err: err}
 		}
 
 		// Resolved after the join, so PATH is searched in the container's
@@ -285,25 +276,98 @@ func (r *Runner) startInNamespaces(
 		// thread that can actually see it.
 		path, err := resolveCommand(cfg.Args[0], cfg.Env)
 		if err != nil {
-			done <- outcome{err: err}
-			return
+			return execOutcome{err: err}
 		}
 		cfg.Path = path
 
 		p, err := process.New(cfg)
 		if err != nil {
-			done <- outcome{err: err}
-			return
+			return execOutcome{err: err}
 		}
 		if err := p.Start(ctx); err != nil {
-			done <- outcome{err: err}
-			return
+			return execOutcome{err: err}
 		}
 
-		done <- outcome{p: p}
-	}()
-
-	res := <-done
+		return execOutcome{p: p}
+	})
 
 	return res.p, res.err
+}
+
+// execOutcome is what the thread that joins the namespaces produces: the
+// started process, or the reason there is none.
+type execOutcome struct {
+	p   *process.Process
+	err error
+}
+
+// isMainThread reports whether the calling goroutine is running on the
+// process's initial thread, which on Linux is the one whose thread ID equals
+// the process ID.
+//
+// It is a variable so that the regression test can force the branch below,
+// which is otherwise entirely at the mercy of the scheduler — and a bug that
+// only appears when the scheduler happens to choose one particular thread is
+// exactly the kind that comes back.
+var isMainThread = func() bool { return unix.Gettid() == os.Getpid() }
+
+// onDisposableThread runs fn on an OS thread that is locked to it and that the
+// Go runtime will destroy afterwards, and returns what fn produced.
+//
+// # Why the main thread has to be excluded
+//
+// "Lock the thread, never unlock it, let the goroutine's exit destroy it" is
+// the discipline that keeps a setns contained, and it holds for every thread
+// the Go runtime creates — but not for the one it did not create. The initial
+// thread is special twice over:
+//
+//   - The runtime cannot terminate it. runtime.mexit parks m0 forever rather
+//     than exiting it ("this is the main thread; just wedge it"), so a locked
+//     goroutine returning disposes of any thread except this one. The setns is
+//     then permanent for the life of the process.
+//   - /proc/self is the thread group leader, which is that same thread. So its
+//     namespaces are the ones the process appears to be in from the outside:
+//     every /proc/self/ns read by Forge, by a test, or by anything inspecting
+//     the process reports the container's namespaces rather than the host's,
+//     for good.
+//
+// Nothing stops the runtime scheduling an ordinary goroutine onto m0, so
+// `go func() { LockOSThread(); setns(...) }` lands there sooner or later. That
+// is the whole bug, and it is intermittent by nature.
+//
+// The fix is to notice and step aside. A goroutine that finds itself on the
+// main thread keeps it locked — which is what guarantees the goroutine it then
+// starts cannot be scheduled onto it — and hands the work to that one instead.
+// It performs no setns itself, so the thread it hands back is exactly as it
+// found it. The recursion is one level deep at most, for the same reason.
+func onDisposableThread(fn func() execOutcome) execOutcome {
+	done := make(chan execOutcome, 1)
+	go runLocked(done, fn)
+
+	return <-done
+}
+
+// runLocked is the body of onDisposableThread, factored out so the main-thread
+// case can re-enter it.
+func runLocked(done chan<- execOutcome, fn func() execOutcome) {
+	goruntime.LockOSThread()
+
+	if isMainThread() {
+		// Held, not released, until the work is finished: an unlocked m0 is a
+		// thread the runtime may schedule the goroutine below onto, which is
+		// the situation being avoided.
+		inner := make(chan execOutcome, 1)
+		go runLocked(inner, fn)
+		res := <-inner
+
+		// Safe to give back. Nothing above touched this thread's namespaces.
+		goruntime.UnlockOSThread()
+		done <- res
+
+		return
+	}
+
+	// No UnlockOSThread, and no defer: see above. The thread dies with this
+	// goroutine.
+	done <- fn()
 }

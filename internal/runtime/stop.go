@@ -91,7 +91,7 @@ func (r *Runner) Stop(ctx context.Context, id string, opts StopOptions) error {
 			return err
 		}
 		if opts.Remove {
-			return r.Remove(ctx, id, RemoveOptions{})
+			return r.removeAfterStop(ctx, id)
 		}
 		return nil
 	}
@@ -119,7 +119,30 @@ func (r *Runner) Stop(ctx context.Context, id string, opts StopOptions) error {
 	log.Info("container stopped")
 
 	if opts.Remove {
-		return r.Remove(ctx, id, RemoveOptions{})
+		return r.removeAfterStop(ctx, id)
+	}
+
+	return nil
+}
+
+// removeAfterStop performs the --rm half of a stop.
+//
+// A record that has already gone is success, for the same reason finaliseRecord
+// treats it that way: the container Forge was asked to remove is not there, and
+// the commonest way for that to happen is not a race with another `forge rm`
+// but the ordinary end of an attached run. A container started without --keep
+// has its record deleted by its own supervising `forge run` as it unwinds, and
+// that unwind is triggered by the very exit this stop just waited for. Stop and
+// the supervisor are therefore always removing the same record at the same
+// moment, and whichever loses would otherwise report "no such container" for a
+// stop that did exactly what it was asked to do.
+//
+// It is only this path that may be forgiving. `forge rm` of a container that
+// never existed is still an error: there the missing record is the answer to
+// the user's question rather than the outcome they asked for.
+func (r *Runner) removeAfterStop(ctx context.Context, id string) error {
+	if err := r.Remove(ctx, id, RemoveOptions{}); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
 	}
 
 	return nil

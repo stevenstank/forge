@@ -105,7 +105,19 @@ func liveContainer(ctx context.Context, t *testing.T) (*runtime.Runner, string, 
 	runner := testutil.NewRunner(t)
 
 	spec := helperSpec(t, "sleep-forever")
-	spec.Network = network.ModeHost
+
+	// Overriding the harness default, which is host networking: every earlier
+	// stage's container shares the host's network namespace, and a container
+	// that shares it has nothing for exec to join. The assertions in this file
+	// are equalities against the container's namespaces *and* inequalities
+	// against the host's, and the second kind proves nothing for a namespace
+	// the container never had.
+	//
+	// none rather than bridge, because what is needed here is CLONE_NEWNET and
+	// nothing else: a private namespace with loopback in it, no bridge, no
+	// address, no NAT. The exec'd helpers print namespace identities and read
+	// /proc; none of them talks to anything.
+	spec.Network = network.ModeNone
 	live := testutil.StartLiveWithRunner(ctx, t, runner, spec)
 	live.WaitForOutput(t, readyMarker, testutil.DefaultTimeout)
 
@@ -201,6 +213,30 @@ func containerNamespaces(t *testing.T, runner *runtime.Runner, id string) map[st
 	}
 
 	return found
+}
+
+// TestExecFixtureContainerIsIsolated pins the premise every assertion below
+// rests on: the container these tests exec into is in namespaces of its own.
+//
+// It is a test about the fixture rather than about exec, and it exists because
+// the failure it guards against is silent. A container sharing one of the
+// host's namespaces makes the corresponding "the exec joined the container"
+// equality true for free — both sides read the host — so the suite goes on
+// passing while proving nothing about the namespace in question. Asserting the
+// separation directly is the only way that shows up as a failure, and it fails
+// here rather than inside a test whose subject is something else.
+func TestExecFixtureContainerIsIsolated(t *testing.T) {
+	requireRoot(t)
+
+	runner, id, _ := liveContainer(t.Context(), t)
+
+	container := containerNamespaces(t, runner, id)
+	for _, kind := range isolatedNamespaces {
+		if host := hostNamespace(t, kind); container[kind] == host {
+			t.Errorf("the container's %s namespace = %s, which is the host's: "+
+				"exec has nothing to join and the assertions in this file prove nothing", kind, host)
+		}
+	}
 }
 
 // TestExecJoinsEveryNamespace is the requirement, stated as an equality: the

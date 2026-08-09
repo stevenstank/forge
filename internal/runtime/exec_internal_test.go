@@ -4,8 +4,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/stevenstank/forge/internal/state"
 )
@@ -229,5 +232,119 @@ func TestResolveCommand(t *testing.T) {
 				t.Errorf("resolveCommand() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// The thread the namespaces are joined on, which is the one part of exec that
+// can damage the process running it.
+//
+// setns(2) moves a thread and nothing else, so `forge exec` is built around a
+// thread it is willing to lose: locked to one goroutine, never unlocked,
+// destroyed by the Go runtime when that goroutine returns. The initial thread
+// is the exception — the runtime parks m0 rather than destroying it, and
+// /proc/self reports the thread group leader's namespaces — so joining on it
+// moves the whole process into the container, permanently and visibly.
+//
+// Neither test below performs a setns: what is being checked is which thread
+// the work is handed to, and that is decided before any namespace is touched.
+
+// TestOnDisposableThreadNeverUsesTheMainThread is the invariant, checked
+// against the real scheduler.
+func TestOnDisposableThreadNeverUsesTheMainThread(t *testing.T) {
+	main := os.Getpid() // the initial thread's TID, by definition on Linux
+
+	// Repeated, because the scheduler's choice of thread is what is being
+	// guarded against and a single run proves very little about it.
+	for i := range 200 {
+		var tid int
+		onDisposableThread(func() execOutcome {
+			tid = unix.Gettid()
+			return execOutcome{}
+		})
+
+		if tid == main {
+			t.Fatalf("run %d joined namespaces on the main thread (tid %d): "+
+				"the runtime cannot destroy it, so the process would be left in the container", i, tid)
+		}
+	}
+}
+
+// TestOnDisposableThreadStepsOffTheMainThread forces the case the test above
+// can only wait for.
+//
+// The first thread to ask is told it is the main one, which is the scheduler
+// making the unlucky choice. The work must land somewhere else, and the
+// somewhere else must be a thread of its own rather than the same one asked
+// twice.
+func TestOnDisposableThreadStepsOffTheMainThread(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		pretend  int
+		asked    []int
+		observed int
+	)
+
+	original := isMainThread
+	t.Cleanup(func() { isMainThread = original })
+
+	isMainThread = func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		tid := unix.Gettid()
+		asked = append(asked, tid)
+		if pretend == 0 {
+			pretend = tid
+		}
+		return tid == pretend
+	}
+
+	res := onDisposableThread(func() execOutcome {
+		observed = unix.Gettid()
+		return execOutcome{}
+	})
+	if res.err != nil {
+		t.Fatalf("onDisposableThread() = %v, want the work to have run", res.err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if observed == 0 {
+		t.Fatal("the work never ran")
+	}
+	if observed == pretend {
+		t.Errorf("the work ran on the main thread (tid %d)", observed)
+	}
+	if len(asked) != 2 {
+		t.Errorf("the main-thread check ran %d times, want 2: once on the thread that steps "+
+			"aside and once on the one that does the work", len(asked))
+	}
+}
+
+// TestOnDisposableThreadReturnsTheOutcome checks the plumbing the two tests
+// above depend on but do not assert: whatever the work produced comes back to
+// the caller, from either thread.
+func TestOnDisposableThreadReturnsTheOutcome(t *testing.T) {
+	want := errors.New("the command could not be started")
+
+	if got := onDisposableThread(func() execOutcome { return execOutcome{err: want} }); got.err != want {
+		t.Errorf("err = %v, want %v", got.err, want)
+	}
+
+	original := isMainThread
+	t.Cleanup(func() { isMainThread = original })
+
+	first := true
+	isMainThread = func() bool {
+		if first {
+			first = false
+			return true
+		}
+		return false
+	}
+
+	if got := onDisposableThread(func() execOutcome { return execOutcome{err: want} }); got.err != want {
+		t.Errorf("err through the main-thread path = %v, want %v", got.err, want)
 	}
 }
