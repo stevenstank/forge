@@ -1,8 +1,13 @@
 # Forge — Product Requirements Document (PRD)
 
-**Status:** Draft v1.0
+**Status:** v1.0 — Delivered. Stages 1–6 are implemented, tested and shipped.
 **Owner:** Systems Engineering
 **Audience:** Contributors, maintainers, reviewers
+
+> This document is now a record of what Forge was built to be *and* what it
+> became. The requirements in §8 are stated as they were specified; §15 records
+> what actually shipped against them, including where the delivered behaviour
+> is narrower than the requirement's wording.
 
 ---
 
@@ -247,6 +252,12 @@ The project as a whole is successful when all six stages are complete and a
 user can run `forge run alpine:3.20 /bin/sh`, land in an isolated, resource
 limited, networked shell, and exit cleanly with no host-side residue.
 
+**This criterion is met.** `forge run alpine:3.20 /bin/sh` pulls and verifies
+the image, unpacks it into a per-container rootfs, creates PID/UTS/mount/net
+namespaces, applies a cgroup v2 leaf, plugs a veth into the Forge bridge with
+NAT to the outside world, `pivot_root`s into the image, and releases every one
+of those resources on exit. See §15 for the shape of what shipped.
+
 ---
 
 ## 11. Risks
@@ -264,15 +275,15 @@ limited, networked shell, and exit cleanly with no host-side residue.
 
 ## 12. Milestones
 
-| Milestone | Description | Exit Criteria |
-|---|---|---|
-| M0 | Project scaffolding | Repo structure, CI, Makefile, empty CLI skeleton in place |
-| M1 | Stage 1 complete | Process isolation working, tested, documented |
-| M2 | Stage 2 complete | Filesystem isolation working, tested, documented |
-| M3 | Stage 3 complete | cgroups v2 resource limits working, tested, documented |
-| M4 | Stage 4 complete | Networking (netns, veth, bridge, NAT) working, tested, documented |
-| M5 | Stage 5 complete | OCI image pull/unpack working, tested, documented |
-| M6 | Stage 6 complete | Full CLI (ps/exec/stop/logs) working; Forge is a usable runtime |
+| Milestone | Description | Exit Criteria | Status |
+|---|---|---|---|
+| M0 | Project scaffolding | Repo structure, CI, Makefile, empty CLI skeleton in place | ✅ |
+| M1 | Stage 1 complete | Process isolation working, tested, documented | ✅ |
+| M2 | Stage 2 complete | Filesystem isolation working, tested, documented | ✅ |
+| M3 | Stage 3 complete | cgroups v2 resource limits working, tested, documented | ✅ |
+| M4 | Stage 4 complete | Networking (netns, veth, bridge, NAT) working, tested, documented | ✅ |
+| M5 | Stage 5 complete | OCI image pull/unpack working, tested, documented | ✅ |
+| M6 | Stage 6 complete | Full CLI (ps/exec/stop/logs) working; Forge is a usable runtime | ✅ |
 
 ---
 
@@ -288,14 +299,20 @@ not considered "done" until:
 - A stage-specific ADR exists for any non-obvious design decision made
   during implementation.
 
-| Stage | Name | Primary Kernel Mechanisms | Primary New Packages |
-|---|---|---|---|
-| 1 | Process Isolation | `clone(2)`, PID/UTS/mount namespaces | `internal/namespace`, `internal/process` |
-| 2 | Filesystem Isolation | `pivot_root(2)`, bind mounts | `internal/rootfs`, `internal/mount` |
-| 3 | Resource Limits | cgroups v2 | `internal/cgroup` |
-| 4 | Networking | `CLONE_NEWNET`, veth, bridge, nftables/iptables | `internal/network` |
-| 5 | Images | OCI Image/Distribution specs | `internal/image`, `internal/registry` |
-| 6 | Runtime | process supervision, IPC, state store | `internal/runtime`, `internal/state`, `cmd/forge` (expanded) |
+| Stage | Name | Primary Kernel Mechanisms | Primary New Packages | Status |
+|---|---|---|---|---|
+| 1 | Process Isolation | `clone(2)`, PID/UTS/mount namespaces | `internal/namespace`, `internal/process`, `internal/runtime` (ADR-0007) | ✅ |
+| 2 | Filesystem Isolation | `pivot_root(2)`, bind mounts | `internal/rootfs`, `internal/mount` | ✅ |
+| 3 | Resource Limits | cgroups v2 | `internal/cgroup` | ✅ |
+| 4 | Networking | `CLONE_NEWNET`, veth, bridge, nf_tables over netlink | `internal/network` | ✅ |
+| 5 | Images | OCI Image/Distribution specs | `internal/image` | ✅ |
+| 6 | Runtime | `setns(2)`, process supervision, state store | `internal/state`, `internal/logs`, `cmd/forge` (expanded) | ✅ |
+
+Stage 5 shipped as a single `internal/image` package rather than the
+`image` + `registry` pair this table originally planned: the boundary between
+fetching bytes and unpacking them turned out to be one nothing crossed, and
+splitting it would have created a primitive-to-primitive dependency the
+architecture forbids (ADR-0020).
 
 See SSOT §2–3 for exact package responsibilities.
 
@@ -317,3 +334,59 @@ Explicitly out of scope for v1 but recorded as plausible future work:
 
 These are not scheduled and should not influence Stage 1–6 architecture
 except insofar as the architecture should not actively preclude them.
+
+---
+
+## 15. Delivered Scope
+
+Every functional requirement in §8 is implemented and covered by tests. What
+follows records where the delivered behaviour is narrower than a requirement's
+wording, and what a reader should not assume from §8 alone.
+
+### 15.1 Requirements delivered with a narrower shape
+
+| Requirement | As delivered |
+|---|---|
+| FR-4.4 (NAT "via nftables or iptables") | nf_tables only, and spoken to over a raw `NETLINK_NETFILTER` socket rather than by invoking `nft`. A kernel without nf_tables reports `ErrNATUnavailable` rather than falling back to iptables. |
+| FR-5.3 (layering "via OverlayFS or explicit layer extraction") | Explicit extraction, decided in ADR-0003. Layers are applied in order into one directory, whiteouts executed as deletions at the moment they are read. There is no OverlayFS path and no copy-on-write between containers. |
+| FR-5.1 (pull from a registry) | Single-architecture, anonymous pull. Manifest lists are resolved for the host platform; authenticated registries and multi-arch publishing are out of scope, as §11 anticipated. |
+| FR-6.4 (`forge logs` streams stdout/stderr) | Delivered, plus `-f`, `-n` and `-t`. Output is captured for every container whether or not the run is attached; the log is JSON, one entry per line, and is removed with the container. |
+| FR-6.6 (`forge rm`, `forge stop --rm`) | Delivered as `forge rm [-f]` and `forge stop -rm`. |
+| NFR-5 ("best-effort reconciliation on startup") | There is no startup reconciliation pass. Every resource is idempotently removable and is reclaimed opportunistically instead: a stale IP lease is reclaimed by the next allocation that needs it, and a container whose supervisor was killed is finalised by the `forge stop` or `forge rm` that next meets it. `forge ps` reports what the records say and does not go looking. |
+
+### 15.2 Not delivered, by design
+
+- **Detached containers.** There is no `forge run -d`. A container's lifetime
+  is its `forge run`, which stays attached and propagates the container's exit
+  status (ADR-0009). `--keep` retains the record and filesystem afterwards so
+  `forge ps -a` and `forge rm` have something to act on. Every §8 requirement
+  is satisfiable without `-d`; adding it is future work, not a gap.
+- **User namespaces**, per §5. A container's `root` is the host's `root`, and
+  this is the single largest gap between Forge and a runtime that could be
+  trusted with untrusted code.
+- **seccomp/AppArmor/SELinux**, per §5.
+- **Device-node restriction.** An image layer declaring a character or block
+  device gets one, with the major/minor it asked for, because `forge` unpacks
+  as root. Docker restricts this; Forge does not, and §5's "not hardened to
+  production standards" is doing real work here.
+- **IPv6.** `internal/network` is IPv4-only and says so at the parse boundary.
+
+### 15.3 What the security-relevant code does defend against
+
+Recorded because "not production-hardened" is easily read as "not careful",
+and the distinction matters to anyone reading the source to learn from it:
+
+- Layer entry names that are absolute, contain `..`, or contain a NUL byte are
+  refused rather than cleaned into something plausible.
+- Absolute symlinks inside an image or a rootfs are *rebased* against the
+  container root rather than followed onto the host — in path resolution, in
+  the mount planner, and in the timestamp pass, which was itself an escape
+  route until it was closed.
+- Layers are bounded on both uncompressed size and entry count, because the
+  entry-count attack writes no bytes and the byte bound alone does not see it.
+- Every blob is verified against its digest, on download and again on unpack;
+  a mismatch quarantines the cached bytes.
+- `forge exec` verifies that the recorded PID is still the container's, via a
+  pidfd held across the join, so a recycled PID cannot become someone else's
+  namespaces entered as root — and the `setns` is confined to a thread the
+  runtime discards, never the process's initial thread.

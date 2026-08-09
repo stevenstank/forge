@@ -39,10 +39,16 @@ clean architecture, TDD, and minimal dependencies.
   mounts.
 - **Resource limits** — cgroups v2 for memory, CPU, and process-count limits.
 - **Networking** — per-container network namespaces, veth pairs, a Forge-managed
-  bridge, and NAT for outbound connectivity.
+  bridge, and NAT for outbound connectivity, spoken to the kernel over raw
+  netlink — no `ip`, no `iptables`, no netlink library.
 - **OCI images** — pull, verify, cache, and unpack standard OCI images from
   any compatible registry.
-- **A real CLI** — `forge run`, `forge ps`, `forge exec`, `forge stop`, `forge logs`, `forge rm`.
+- **A real CLI** — `forge run`, `forge ps`, `forge exec`, `forge stop`,
+  `forge logs`, `forge rm`, over a crash-safe on-disk state store.
+
+All six stages are complete. Forge runs `forge run alpine:3.20 /bin/sh` and
+lands you in an isolated, resource-limited, networked shell that leaves nothing
+behind when it exits.
 
 ## Project Goals
 
@@ -54,15 +60,16 @@ clean architecture, TDD, and minimal dependencies.
   working, tested system.
 - Make the mapping from **kernel concept → Go package** obvious.
 
-See [PRD.md](./PRD.md) for the full product requirements and
-[SSOT.md](./SSOT.md) for the engineering architecture reference.
+See [docs/PRD.md](./docs/PRD.md) for the full product requirements and
+[docs/SSOT.md](./docs/SSOT.md) for the engineering architecture reference.
 
 ## Non-goals
 
 Forge intentionally does not implement: Dockerfile-style image building,
 multi-host orchestration, rootless containers, seccomp/AppArmor/SELinux
-integration, or a plugin system. See [PRD.md §5](./PRD.md#5-non-goals) for the
-complete list and rationale.
+integration, or a plugin system. See
+[docs/PRD.md §5](./docs/PRD.md#5-non-goals) for the complete list and
+rationale.
 
 ---
 
@@ -104,12 +111,14 @@ sudo ./bin/forge run /bin/echo "hello from forge"
 
 ## Example Commands
 
-> **Stage 3 is the current stage.** `forge run` takes a **path to a binary**,
-> not an image reference — images arrive in Stage 5. Without `-rootfs` that path
-> is on the host and the container shares the host's filesystem, exactly as in
-> Stage 1. With `-rootfs` it is a path *inside* the container's own root
-> filesystem. The commands listed under later stages below do not exist yet;
+> **All six stages are implemented**, and every example below works today.
 > `forge -h` always lists exactly what is implemented.
+>
+> `forge run` accepts three grammars, decided without a lookahead flag: an
+> image reference (`alpine:3.20 /bin/sh`), a `-rootfs` directory plus a command,
+> or — with neither — an absolute path run against the host's filesystem, which
+> is Stage 1's behaviour and still valid. An argument beginning with `/`, `./`
+> or `../` is a command; anything else in first position is an image.
 
 ### Stage 1 — process isolation
 
@@ -227,70 +236,189 @@ ls /sys/fs/cgroup/forge                              # → empty
 > than starting uncapped; a container that asked for nothing still runs, losing
 > only accounting.
 
-Later stages will add:
+### Stage 4 — networking
+
+Every container gets its own network namespace and, by default, a veth pair
+plugged into a Forge-managed bridge (`forge0`) with an address from
+`10.99.0.0/16` and NAT to the outside world. The bridge and its NAT rules are
+created on first use, over raw netlink and nf_tables.
 
 ```bash
-sudo forge run alpine:3.20 /bin/sh        # Stage 5: OCI images
-sudo forge ps                             # Stage 6
-sudo forge exec <container-id> /bin/ps    # Stage 6
-sudo forge logs -f <container-id>         # Stage 6
-sudo forge stop <container-id>            # Stage 6
-sudo forge rm <container-id>              # Stage 6
+# The default: a private netns with a real address and a route out
+sudo forge run --rootfs /srv/alpine /sbin/ip addr
+
+# The container can reach the internet through the host
+sudo forge run --rootfs /srv/alpine /bin/ping -c1 1.1.1.1
+
+# Isolated instead of connected: a netns with nothing in it but loopback
+sudo forge run --network none --rootfs /srv/alpine /sbin/ip addr   # → lo only
+
+# Share the host's network stack, which is what Stages 1-3 did
+sudo forge run --network host --rootfs /srv/alpine /sbin/ip addr
+
+# Cap the interface MTU (bridge mode only)
+sudo forge run --mtu 1400 --rootfs /srv/alpine /sbin/ip link
+
+# The veth and the IP lease go with the container, whatever it exits with
+sudo forge run --rootfs /srv/alpine /bin/true
+ip link | grep fh                                    # → nothing
+ls /var/lib/forge/network/leases                     # → empty
 ```
+
+> **An address is claimed before the container exists** and the lease records
+> the claiming PID, so a `forge` killed with SIGKILL cannot leak an address: the
+> next allocation reclaims any lease whose veth *and* whose owner are both gone.
+
+### Stage 5 — OCI images
+
+```bash
+# Pull, verify, unpack and run — the first positional is now an image
+sudo forge run alpine:3.20 /bin/sh -c 'cat /etc/alpine-release'
+
+# The image supplies the command, the environment and the working directory
+sudo forge run alpine:3.20                           # → the image's own CMD
+
+# Fully-qualified references work too
+sudo forge run docker.io/library/busybox:latest /bin/echo hi
+
+# Layers are cached by digest: the second run downloads nothing
+sudo forge run alpine:3.20 /bin/true
+du -sh /var/lib/forge/images
+
+# Flags compose with everything below them
+sudo forge run --memory 256m --cpus 1 --network none alpine:3.20 /bin/sh
+```
+
+> **Every byte is verified.** The manifest, the config, and each layer are
+> checked against their digests — the layer as it is decompressed, so a corrupt
+> cached blob is caught, named, quarantined, and re-downloaded rather than
+> unpacked. Layer extraction refuses absolute and `../` entry names, rebases
+> absolute symlinks against the image root rather than following them onto the
+> host, and bounds both the uncompressed size and the entry count of a layer.
+
+### Stage 6 — the runtime
+
+Containers are recorded in a crash-safe on-disk state store, so a second
+terminal can see, enter, and stop them. `forge run` is attached and blocks
+until the container exits; `--keep` is what leaves a record behind for
+`forge ps -a` and `forge rm` afterwards.
+
+```bash
+# In one terminal: a container to work with
+sudo forge run --keep alpine:3.20 /bin/sh -c 'while :; do date; sleep 1; done'
+
+# In another: what is running
+sudo forge ps
+# CONTAINER ID   IMAGE          COMMAND        STATUS    CREATED         PID
+# 7f3c9a1b2d04   alpine:3.20    /bin/sh -c …   running   12 seconds ago  48213
+
+sudo forge ps -a                     # include containers that have finished
+sudo forge ps -q                     # IDs only, for scripting
+
+# Run a second process inside the container's namespaces
+sudo forge exec 7f3c9a1b2d04 /bin/ps          # → the container's processes, not the host's
+sudo forge exec -workdir /etc 7f3c9a1b2d04 /bin/pwd
+sudo forge exec -env FOO=bar 7f3c9a1b2d04 /bin/sh -c 'echo $FOO'
+
+# Everything the container wrote, captured whether or not you were attached
+sudo forge logs 7f3c9a1b2d04
+sudo forge logs -f 7f3c9a1b2d04               # follow until it exits
+sudo forge logs -n 20 -t 7f3c9a1b2d04         # last 20 entries, with timestamps
+
+# SIGTERM, then SIGKILL after the timeout
+sudo forge stop 7f3c9a1b2d04
+sudo forge stop -t 30 7f3c9a1b2d04
+sudo forge stop -rm 7f3c9a1b2d04              # ...and remove it once it is gone
+
+# Remove a stopped container and everything still held for it
+sudo forge rm 7f3c9a1b2d04
+sudo forge rm -f 7f3c9a1b2d04                 # stop it first if it is still running
+```
+
+> **`forge exec` never moves Forge itself.** `setns(2)` changes the namespace of
+> the calling *thread*, so the join happens on a thread locked to one goroutine,
+> never unlocked, and destroyed when that goroutine returns — with an explicit
+> guard against the process's initial thread, which the Go runtime parks rather
+> than terminates and whose namespaces are the ones `/proc/self` reports.
+
+### Where Forge keeps things
+
+| Path | Contents |
+|---|---|
+| `/var/lib/forge/state/containers/<id>/` | `metadata.json` — the container record, plus its lock |
+| `/var/lib/forge/containers/<id>/rootfs` | the container's root filesystem |
+| `/var/lib/forge/images/` | the content-addressed layer blob cache |
+| `/var/lib/forge/logs/<id>` | captured stdout/stderr, one JSON entry per line |
+| `/var/lib/forge/network/leases/<ip>` | IP leases, one file per claimed address |
+| `/sys/fs/cgroup/forge/<id>/` | the container's cgroup v2 leaf |
+
+`--state-dir`, `--root` and `--image-root` move the first four; the cgroup root
+follows the host's unified hierarchy.
 
 ---
 
 ## Roadmap
 
 Forge is built in six stages. Each stage is a complete, working system in
-its own right.
+its own right. **All six are complete.**
 
 | Stage | Focus | Key Mechanisms | Status |
 |---|---|---|---|
 | 1 | Process Isolation | PID / UTS / mount namespaces | ✅ Complete |
 | 2 | Filesystem Isolation | `pivot_root`, bind mounts | ✅ Complete |
 | 3 | Resource Limits | cgroups v2 (memory, CPU, pids) | ✅ Complete |
-| 4 | Networking | network namespaces, veth, bridge, NAT | Not started |
-| 5 | Images | OCI image pull, unpack, layer cache | Not started |
-| 6 | Runtime | `ps` / `exec` / `stop` / `logs`, full lifecycle | Not started |
+| 4 | Networking | network namespaces, veth, bridge, NAT | ✅ Complete |
+| 5 | Images | OCI image pull, unpack, layer cache | ✅ Complete |
+| 6 | Runtime | `ps` / `exec` / `stop` / `logs` / `rm`, full lifecycle | ✅ Complete |
 
-Full detail on each stage is in [PRD.md §13](./PRD.md#13-stage-breakdown).
+Full detail on each stage is in
+[docs/PRD.md §13](./docs/PRD.md#13-stage-breakdown), with per-stage design
+notes in [docs/stages/](./docs/stages).
 
 ## Project Structure
 
 ```
 forge/
-├── cmd/forge/          # CLI entrypoint
+├── cmd/forge/            # CLI entrypoint (wiring only)
 ├── internal/
-│   ├── process/         # process creation & lifecycle
-│   ├── namespace/       # namespace setup, in-child namespace configuration
-│   ├── rootfs/          # root filesystem management
-│   ├── mount/           # pivot_root, bind mounts
-│   ├── cgroup/          # cgroups v2 management
-│   ├── network/         # netns, veth, bridge, NAT
-│   ├── image/           # OCI image unpack & layering
-│   ├── registry/        # OCI registry client
-│   ├── runtime/         # container orchestration
-│   ├── state/           # on-disk state store
-│   └── cli/             # CLI command implementations
-├── test/integration/    # privileged integration tests
-├── docs/adr/             # architecture decision records
-├── PRD.md
-├── SSOT.md
+│   ├── process/           # process creation & lifecycle
+│   ├── namespace/         # namespace creation (clone flags) and entry (setns)
+│   ├── rootfs/            # per-container root filesystem directories
+│   ├── mount/             # pivot_root, bind mounts, mount cleanup
+│   ├── cgroup/            # cgroups v2 management
+│   ├── network/           # netns, veth, bridge, NAT, IP leases
+│   ├── image/             # OCI registry client, blob cache, layer unpack
+│   ├── runtime/           # container orchestration — the conductor
+│   ├── state/             # on-disk container records
+│   ├── logs/              # captured stdout/stderr
+│   ├── cli/               # CLI command implementations
+│   └── logging/           # structured logging helpers
+├── test/integration/      # privileged integration tests (build tag)
+├── docs/
+│   ├── adr/               # architecture decision records
+│   ├── stages/            # per-stage design notes
+│   ├── PRD.md
+│   └── SSOT.md
+├── Makefile
 └── README.md
 ```
 
-See [SSOT.md §2](./SSOT.md#2-package-layout--responsibilities) for a full
+There is no `internal/registry`: the registry client, the blob cache and the
+unpacker are one package, because the seam between them was never a seam
+anybody crossed ([ADR-0020](./docs/adr/0020-single-image-package.md)).
+
+See [SSOT.md §2](./docs/SSOT.md#2-package-layout--responsibilities) for a full
 description of each package's responsibilities and boundaries.
 
 ## Development Philosophy
 
 - **Standard library first.** New dependencies require an ADR justifying
-  them (see [SSOT.md §10](./SSOT.md#10-dependency-rules)). Forge has exactly
-  one: `golang.org/x/sys/unix`, for syscalls the frozen `syscall` package will
-  not grow ([ADR-0013](./docs/adr/0013-golang-x-sys-dependency.md)).
+  them (see [SSOT.md §10](./docs/SSOT.md#10-dependency-rules)). Forge has
+  exactly one: `golang.org/x/sys/unix`, for syscalls the frozen `syscall`
+  package will not grow
+  ([ADR-0013](./docs/adr/0013-golang-x-sys-dependency.md)).
 - **Test-driven.** Tests are written alongside — ideally before —
-  implementation. See [SSOT.md §7](./SSOT.md#7-testing-strategy).
+  implementation. See [SSOT.md §7](./docs/SSOT.md#7-testing-strategy).
 - **One package, one kernel mechanism.** The package layout mirrors the
   underlying Linux primitives so the codebase doubles as documentation.
 - **No shortcuts through existing runtimes.** Forge never shells out to
@@ -301,14 +429,35 @@ description of each package's responsibilities and boundaries.
   path, and this is tested.
 
 The full set of engineering invariants is documented in
-[SSOT.md §13](./SSOT.md#13-engineering-invariants) and should not be
+[SSOT.md §13](./docs/SSOT.md#13-engineering-invariants) and should not be
 violated without an explicit ADR.
+
+## Known limitations
+
+Forge is conceptually complete, not production-hardened. The gaps that matter
+most, all of them deliberate:
+
+- **No user namespaces.** A container's `root` is the host's `root`. This is
+  the single largest difference between Forge and a runtime you would trust
+  with someone else's code.
+- **No seccomp, AppArmor or SELinux.** A container may make any syscall its
+  uid allows.
+- **Device nodes come from the image.** A layer declaring a block device gets
+  one, with the major/minor it asked for. Docker restricts this; Forge does
+  not.
+- **IPv4 only**, single host, one bridge.
+- **`forge run` is attached only.** There is no `-d`; a container's lifetime is
+  its `forge run`. `--keep` is what leaves a record for `forge ps -a` and
+  `forge rm` after it exits.
+- **`forge ps` reports what the records say** and does not reconcile them
+  against the kernel, so a container whose `forge run` was killed still reads
+  `running` until `forge stop` or `forge rm` meets it.
 
 ## Contributing
 
 Contributions are welcome. Before opening a PR:
 
-1. Read [SSOT.md](./SSOT.md) — it is the authoritative architecture
+1. Read [docs/SSOT.md](./docs/SSOT.md) — it is the authoritative architecture
    reference and PR reviews will be checked against it.
 2. If your change affects package boundaries, architecture, or the
    engineering invariants, add or update an ADR in `docs/adr/`.

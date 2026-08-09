@@ -1,13 +1,21 @@
 # Forge — Single Source of Truth (SSOT)
 
-**Status:** Living document. Update in the same PR as any architectural change.
+**Status:** Living document, current as of the end of Stage 6. Update in the
+same PR as any architectural change.
 **Purpose:** This is the authoritative engineering reference for Forge. If
 code and this document disagree, that is a bug — in the code or in the
 document — and must be resolved before merge.
 
+> Stages 1–6 are complete. This document has been reconciled against the
+> delivered code: §1, §9, §11 and §12 describe what exists rather than what was
+> planned, and §15 records where the ADR register still owes the codebase a
+> written decision.
+
 ---
 
 ## 1. Repository Structure
+
+This is the structure as built, at the end of Stage 6.
 
 ```
 forge/
@@ -15,39 +23,41 @@ forge/
 │   └── forge/                # CLI entrypoint (main package)
 │       └── main.go
 ├── internal/
-│   ├── process/               # Stage 1: process creation & lifecycle
-│   ├── namespace/              # Stage 1: namespace setup (PID, UTS, mount, net)
-│   ├── rootfs/                 # Stage 2: root filesystem management
-│   ├── mount/                  # Stage 2: mount/unmount, pivot_root
-│   ├── cgroup/                  # Stage 3: cgroups v2 management
-│   ├── network/                 # Stage 4: netns, veth, bridge, NAT
-│   ├── image/                   # Stage 5: OCI image handling, layer unpack
-│   ├── registry/                # Stage 5: registry client (pull, auth, manifest)
-│   ├── runtime/                  # Stage 6: container orchestration/supervision
-│   ├── state/                    # Stage 6: on-disk state store
-│   ├── cli/                       # CLI command implementations (thin layer over runtime)
-│   └── logging/                    # Structured logging helpers
-├── pkg/
-│   └── oci/                         # Public, reusable OCI spec types (if extracted)
+│   ├── process/              # Stage 1: process creation & lifecycle
+│   ├── namespace/            # Stage 1: namespace creation (clone flags) and entry (setns)
+│   ├── rootfs/               # Stage 2: per-container root filesystem directories
+│   ├── mount/                # Stage 2: mount/unmount, pivot_root, mount cleanup
+│   ├── cgroup/               # Stage 3: cgroups v2 management
+│   ├── network/              # Stage 4: netns, veth, bridge, NAT, IP leases
+│   ├── image/                # Stage 5: registry client, blob cache, layer unpack
+│   ├── runtime/              # Stages 1-6: container orchestration/supervision
+│   ├── state/                # Stage 6: on-disk container records
+│   ├── logs/                 # Stage 6: captured container stdout/stderr
+│   ├── cli/                  # CLI command implementations (thin layer over runtime)
+│   └── logging/              # Structured logging helpers
 ├── test/
-│   ├── integration/                  # Root/privileged integration tests (build-tagged)
-│   └── testutil/                      # Shared test helpers, fixtures
+│   └── integration/          # Root/privileged integration tests (build tag `integration`)
+│       └── testutil/         # Shared test helpers, fixtures
 ├── docs/
-│   ├── adr/                            # Architecture Decision Records
-│   └── stages/                          # Per-stage design notes
-├── scripts/                              # Dev/CI helper scripts
+│   ├── adr/                  # Architecture Decision Records
+│   ├── stages/               # Per-stage design notes
+│   ├── PRD.md
+│   └── SSOT.md
 ├── Makefile
 ├── go.mod
 ├── go.sum
-├── PRD.md
-├── SSOT.md
 └── README.md
 ```
 
-**Rule:** `internal/` packages are never imported outside the module. `pkg/`
-is reserved for types genuinely useful to external consumers (e.g. OCI spec
-structs) and must remain dependency-light. Until there is a concrete external
-consumer, prefer `internal/`.
+**Rule:** `internal/` packages are never imported outside the module. There is
+no `pkg/`: no type in Forge has an external consumer, and the rule was always
+"prefer `internal/` until one exists". One never did.
+
+Two directories this document previously anticipated do not exist and are not
+missing: `pkg/oci/` (above) and `scripts/` — the Makefile carries everything a
+helper script would have. `internal/registry` was folded into `internal/image`
+by ADR-0020; `internal/logs` was not anticipated at all and arrived with
+Stage 6's `forge logs`.
 
 ---
 
@@ -63,15 +73,16 @@ consumer, prefer `internal/`.
 | `internal/network` | netns creation, veth pair creation, bridge attachment, IP allocation, NAT rules | Own container lifecycle — only owns networking resources for a given container ID |
 | `internal/image` | Everything between an image reference and a populated directory: reference parsing, the OCI Distribution Spec client (anonymous auth, manifest fetch, blob download), digest verification, the content-addressed blob cache, layer unpacking (ADR-0020) | Know what a container is — it is handed a destination directory and writes into it. Decide *which* image, *which* platform, or *where* the rootfs goes: those are `internal/runtime`'s |
 | `internal/runtime` | Orchestrate the above packages to implement container lifecycle (create, start, stop, exec, remove); the "conductor". Also owns container ID generation (§8) and `Init`, the container-side entry point Forge re-executes itself as (ADR-0008). First appears in **Stage 1** — orchestration has to live somewhere from the first stage, and §13.2 says it lives here (ADR-0007) — and grows through Stage 6 | Contain namespace/cgroup/mount syscall logic itself — always delegates |
-| `internal/state` | Persist and query container metadata (ID, PID, status, image, timestamps) on disk | Perform any kernel resource management |
+| `internal/state` | Persist and query container metadata (ID, PID, status, image, timestamps) on disk, crash-safely: atomic replace plus `flock` per record | Perform any kernel resource management |
+| `internal/logs` | Append and read a container's captured stdout/stderr as a stream of timestamped, stream-tagged JSON entries | Decide what is worth logging, or know why a container produced output |
 | `internal/cli` | Parse CLI args/flags, call into `internal/runtime`, format output | Contain business logic — CLI packages are intentionally "dumb" |
 | `internal/logging` | Structured logger construction, log level configuration | N/A (leaf package, no internal dependencies) |
 
 **Dependency rule (strict, see §9):** `internal/runtime` may depend on every
 other `internal/*` package. No other package may depend on `internal/runtime`.
 Leaf packages (`process`, `namespace`, `rootfs`, `mount`, `cgroup`, `network`,
-`image`, `state`, `logging`) must not depend on each other. There are no
-exceptions: the two this document previously allowed, `rootfs` → `image` and
+`image`, `state`, `logs`, `logging`) must not depend on each other. There are
+no exceptions: the two this document previously allowed, `rootfs` → `image` and
 `image` → `registry`, were both retired by ADR-0020 when Stage 5 was
 implemented.
 
@@ -249,33 +260,67 @@ creation.
 - Global flags: `--log-level`, `--state-dir` (default
   `/var/lib/forge`), `--root` (rootfs storage root, default
   `/var/lib/forge/containers`), `--image-root` (blob cache root, default
-  `/var/lib/forge/images`, arrives with Stage 5's runtime integration). `--root`
-  and `--image-root` are independent so they can sit on different filesystems.
-- Subcommands (final set, delivered incrementally by stage):
-  - `forge run [flags] <image|rootfs-path> [cmd] [args...]`
-    - **Until Stage 5**, the root filesystem is named by a `-rootfs` *flag*
-      rather than positionally, and the positional argument is the command:
-      `forge run -rootfs <dir> <cmd> [args...]`. Omitting `-rootfs` runs the
-      command against the host's filesystem, which is Stage 1's behaviour and
-      remains valid. The positional `<image>` form arrives with images in
-      Stage 5, when there is a reference to resolve.
-    - Stage 2 flags: `-rootfs`, `-mount src:dst[:opts]` (repeatable),
-      `-read-only`, `-workdir`.
-  - `forge ps [-a]`
-  - `forge exec <container-id> <cmd> [args...]`
-  - `forge stop [-t timeout] <container-id>`
-  - `forge logs [-f] <container-id>`
-  - `forge rm <container-id>`
+  `/var/lib/forge/images`). `--root` and `--image-root` are independent so they
+  can sit on different filesystems.
+
+### 9.1 On-disk layout
+
+What each flag actually moves, and who owns each tree:
+
+| Path | Owner | Contents |
+|---|---|---|
+| `<state-dir>/state/containers/<id>/metadata.json` | `internal/state` | the container record, with `.lock` beside it |
+| `<state-dir>/logs/<id>` | `internal/logs` | captured output, one JSON entry per line |
+| `<root>/<id>/rootfs` | `internal/rootfs` | the container's root filesystem |
+| `<image-root>/blobs/…` | `internal/image` | the content-addressed layer cache |
+| `/var/lib/forge/network/leases/<ip>` | `internal/network` | one file per claimed address, holding the owning container ID and PID |
+| `/sys/fs/cgroup/forge/<id>/` | `internal/cgroup` | the container's cgroup v2 leaf |
+
+Two of these are not repointed by any global flag, and both are deliberate
+rather than overlooked: the cgroup path follows the host's unified hierarchy
+(`cgroup.DefaultRoot` + `cgroup.ParentName`), and the network lease directory
+takes `network.DefaultStateDir` because `internal/cli` does not populate
+`runtime.Config.Network`. A test that needs its own pool sets that field
+directly. If `--state-dir` is ever expected to move the leases too, that is a
+change to `newRunner`, and it should be made deliberately: leases outliving a
+redirected state directory is the failure it would fix.
+- Subcommands (the final set, all delivered):
+  - `forge run [flags] <image> [cmd] [args...]`
+    - Three grammars, disambiguated by `splitImageAndCommand` without a
+      lookahead flag: `-rootfs <dir>` given means the positionals are the
+      command; a first positional beginning `/`, `./` or `../` is a command
+      run against the host's filesystem (Stage 1, still valid); anything else
+      in first position is an image reference and the rest is the command.
+      The namespaces cannot overlap — a bare command must be an absolute path,
+      and a registry reference can never begin with `/`.
+    - Stage 2 flags: `-rootfs`, `-mount src:dst[:ro,nosuid,nodev,noexec]`
+      (repeatable), `-read-only`, `-workdir`; `-hostname` from Stage 1.
+    - Stage 3 flags: `-memory`, `-cpus`, `-cpu-weight`, `-pids`.
+    - Stage 4 flags: `-network bridge|none|host`, `-mtu`.
+    - Stage 6 flags: `-keep`.
+  - `forge ps [-a] [-q]`
+  - `forge exec [-workdir dir] [-env NAME=VALUE] <container-id> <cmd> [args...]`
+  - `forge stop [-t seconds] [-rm] <container-id>`
+  - `forge logs [-f] [-n count] [-t] <container-id>`
+  - `forge rm [-f] <container-id>`
+
+- **There is no `-d`.** `forge run` is attached and blocks until the container
+  exits, propagating its status (ADR-0009); a container's lifetime is its
+  `forge run`. `-keep` is the flag that retains the record and root filesystem
+  afterwards, which is what gives `forge ps -a` and `forge rm` something to act
+  on. Detaching is future work and would need its own ADR: it changes who
+  supervises a container, which is the load-bearing assumption behind `stop`
+  waiting on either the process or the record (§11.2).
 - Internal commands, prefixed `__`, are hidden from help and are not part of
   the user-facing surface. The only one is `__init`, which Forge re-executes
   itself as to set up a container from inside its namespaces (ADR-0008).
 - All commands that mutate state print the affected container ID to stdout
   on success (scriptable, Docker-like convention) and write human-readable
   detail to stderr.
-  - **Exception — `forge run` in attached mode** (ADR-0009): stdout belongs to
-    the container, so Forge writes nothing to it. The container ID is reported
-    on stderr via the `container_id` log field. When Stage 6 adds `-d`, the
-    detached path follows the general rule.
+  - **Exception — `forge run`** (ADR-0009): stdout belongs to the container, so
+    Forge writes nothing to it. The container ID is reported on stderr via the
+    `container_id` log field. Since there is no detached mode, this exception
+    covers every `forge run`.
 - Non-zero exit codes are used consistently: `1` for user error (bad flags,
   unknown container), `2` for internal/unexpected error.
   - **Exception — `forge run`** (ADR-0009): a container that runs is reported
@@ -311,41 +356,98 @@ creation.
 
 ## 11. Data Flow
 
-### 11.1 `forge run` (Stage 6, full pipeline)
+### 11.1 `forge run` (full pipeline)
+
+The order is load-bearing and is explained where it is implemented
+(`runtime.Runner.Run`). The short version: everything that can fail cheaply
+happens before anything is created, and the record is written at the last
+moment before the first container-specific resource exists, because the record
+is how a `forge rm` running tomorrow finds the rest.
 
 ```
-CLI parses args
-   → runtime.CreateContainer(ctx, Spec)
-       → image.ParseReference(ref)     [if image ref, not local path]
-       → image.Client.Resolve(ctx, ref, platform)   → Manifest (digests verified)
-       → image.Pull(ctx, client, cache, repo, manifest)  → blobs cached by digest
-       → rootfs.Store.Prepare(containerID)          → <root>/<id>/rootfs
-       → image.BuildRootfs(ctx, cache, layers, dir) → layers applied in order
-       → state.Create(containerID, metadata)   [status: created]
-       → namespace.Prepare(Config{PID,UTS,Mount,Net})
-       → cgroup.Create(containerID, ResourceLimits)
-       → network.Setup(containerID)     [veth, bridge attach, IP assign]
-       → process.Start(namespace handle, rootfs, cmd)
-           → child: mount.PivotRoot(rootfs)
-           → child: exec(cmd)
-       → state.Update(containerID, status=running, pid=...)
-   → CLI prints containerID
+CLI parses args → runtime.Spec
+   → runtime.Runner.Run(ctx, spec)
+       → image.ParseReference(ref)                    [if the first positional is an image]
+       → image.Client.Resolve(ctx, ref, HostPlatform) → Manifest (digests verified)
+       → image.Pull / Cache                           → blobs cached and verified by digest
+       ── nothing host-visible created yet; a mistyped reference costs nothing ──
+       → state.Store.Save(metadata)                   [status: creating]   ← cleanup stack entry 1
+       → logs.Store.Open(id)                          → captured stdout/stderr
+       → rootfs.Store.Prepare(id)                     → <root>/<id>/rootfs
+       → image.BuildRootfs(ctx, cache, layers, dir)   → layers applied in order
+       → runtime builds a mount.Plan                  (ADR-0011: runtime decides, mount executes)
+       → cgroup.Manager.Create(id, limits)            → leaf, limits written before the container exists
+       → network.Manager.Allocate(id)                 → IP lease claimed before the container exists
+       → process.New/Start with namespace.Config.CloneFlags()
+           → the child is `forge __init` (ADR-0008), re-executed into the new namespaces,
+             blocking on a read of the payload pipe before it does anything else
+           ── the handshake window: the PID exists, the container has run no instruction ──
+           → parent: record status=created and the PID
+           → parent: cgroup.Manager.Add(id, pid)      every limit in force before the payload
+           → parent: network.Manager.Attach(net, pid) a netns can only be named by a PID in it
+           → parent: write the payload; the child unblocks
+           → child: namespace.Apply, mount.Apply, mount.PivotRoot,
+                    network.Configure, execve(cmd)
+       → state.Store.Update(id, status=running)
+       → wait; state.Store.Update(id, status=exited, exitCode=…)
+   → cleanup stack unwinds in reverse (§11.3)
 ```
+
+The handshake is the whole reason a container is never briefly unconstrained: a
+cgroup can only be joined by writing a PID to `cgroup.procs`, and a netns can
+only be named by the PID of a process already inside it, so neither can be done
+before `clone(2)` returns. The child blocking on the pipe is what makes "after
+clone" and "before the container runs" the same moment.
 
 ### 11.2 `forge stop`
 
+Forge has no daemon, so the process running `stop` is almost never the
+container's parent — and only a parent can reap a child or read its exit
+status. `stop` therefore signals and then watches for *either* the process
+disappearing or the record going terminal, and never invents an exit code it
+could not have observed.
+
 ```
 CLI parses args
-   → runtime.StopContainer(ctx, id, timeout)
-       → state.Get(id) → pid
-       → process.Signal(pid, SIGTERM)
-       → wait up to timeout
-       → if still running: process.Signal(pid, SIGKILL)
-       → network.Teardown(id)
-       → cgroup.Destroy(id)
-       → mount.Cleanup(id)
-       → state.Update(id, status=stopped, exitCode=...)
+   → runtime.Runner.Stop(ctx, id, StopOptions{Timeout, Remove})
+       → state.Store.Load(id) → pid            [terminal already? release resources and return]
+       → mark status=stopping                  so `forge ps` and the supervisor both see it
+       → process.Signal(SIGTERM)
+       → await: process gone OR record terminal, up to Timeout
+       → if still there: process.Signal(SIGKILL), await again over KillGrace
+       → network.Manager.Destroy(id)           idempotent; the supervisor is racing to do the same
+       → cgroup.Manager.Destroy(id)            idempotent, same reason
+       → finalise the record                   only if nobody else did; no exit code if nobody saw one
+       → if Remove: Runner.Remove(id), tolerating an already-deleted record
 ```
+
+The container's filesystem, its log and its record deliberately survive a
+`stop`. That is what makes `forge ps -a` able to describe a container that has
+finished, and it is `forge rm`'s job to release them.
+
+### 11.2.1 `forge exec`
+
+The one operation that acts on a container from outside it, and the one with a
+failure mode that damages Forge rather than the container:
+
+```
+   → runtime.Runner.Exec(ctx, ExecSpec)
+       → state.Store.Load(id), refuse anything not running
+       → process.Open(pid) → pidfd, held for the whole setup
+              so "the namespaces of PID n" cannot come to mean a recycled process
+       → namespace.Open(pid, EntryOrder...)   all descriptors, before any is joined
+       → open the container's cgroup directory (clone3 places the child at birth)
+       → on a thread that is locked, never unlocked, and not the initial thread:
+              namespace.Enter(handles)   unshare(CLONE_FS), then setns in EntryOrder
+              resolve the command on the container's PATH
+              fork
+       → wait on an ordinary thread; the joined thread dies with its goroutine
+```
+
+`setns(2)` moves the calling *thread*. The initial thread is excluded
+explicitly because the Go runtime parks it rather than terminating it, and
+`/proc/self` reports its namespaces — joining there would move the whole Forge
+process into the container, permanently and visibly.
 
 ### 11.3 Failure/rollback path
 
@@ -358,25 +460,60 @@ accumulated as each step succeeds, invoked in `defer` on early return.
 
 ## 12. Runtime Lifecycle
 
-Container states (persisted in `internal/state`):
+Container states (persisted in `internal/state`, and enforced by
+`Status.CanTransitionTo`):
 
 ```
-created → running → stopped → removed
-              │
-              └──▶ exited (process exited on its own; distinct from `stopped`
-                            which implies an explicit forge stop)
+creating ─▶ created ─▶ running ─▶ stopping ─┬─▶ stopped ─▶ removing ─▶ (record deleted)
+    │           │          │                │
+    │           └──────────┴────────────────┴─▶ exited ──▶ removing ─▶ (record deleted)
+    └─▶ exited                                             (a container that never started)
 ```
 
-- `created`: namespaces/cgroup/network/rootfs prepared, process not yet
-  exec'd.
-- `running`: init process has been exec'd and is alive.
-- `exited`: init process terminated on its own (any exit code).
-- `stopped`: init process was terminated via `forge stop`.
-- `removed`: all resources released, state entry marked for GC (or deleted,
-  per `forge rm`).
+- `creating`: the record exists and resources are being acquired. A crash here
+  leaves a record that says so.
+- `created`: every resource is prepared and the init process exists, but is
+  still blocked on the payload — the handshake window of §11.1.
+- `running`: the payload was written and the container's own binary is alive.
+- `stopping`: a stop was requested and the grace period is running. Written
+  *before* the signal, so a concurrent `forge ps` says "stopping" rather than
+  "running", and so the supervisor records this as a stop rather than as an
+  exit of the container's own accord.
+- `exited`: the init process terminated on its own, at any exit code.
+- `stopped`: the init process was terminated by `forge stop`.
+- `removing`: the retained resources are being released. This is what makes an
+  interrupted `forge rm` finishable rather than ambiguous: a later `rm` picks
+  it up instead of finding a record that claims to be a healthy stopped
+  container while half its resources are gone.
+
+`exited` and `stopped` are the two terminal states; `removing` is not terminal
+in that sense — the container is finished, but the record is not yet free to be
+deleted. There is no persisted `removed` state, because a removed container has
+no record to hold one.
 
 State transitions are the only place `internal/state` is written by
 `internal/runtime`; no other package touches container state directly.
+
+### 12.1 Who writes a record, and when two processes race
+
+Forge has no daemon, so more than one process routinely holds an opinion about
+one container at the same moment, and every write has to be correct under that:
+
+- The supervising `forge run` owns the container and is the only process that
+  can reap it and read its exit status.
+- A container started **without** `-keep` has its record deleted by that same
+  supervisor as it unwinds — and the unwind is triggered by the very exit a
+  concurrent `forge stop --rm` is waiting for. Both are therefore removing the
+  same record at the same moment. `stop --rm` treats an already-deleted record
+  as success; `forge rm` of a container that never existed remains an error,
+  because there the missing record is the answer to the user's question rather
+  than the outcome they asked for.
+- Every read-modify-write of a record is serialised by an `flock` on the
+  container's directory, released by the kernel when the holder's descriptor
+  closes — including when the holder was killed or the host lost power.
+- Resource teardown is idempotent everywhere (§13.3), because two processes
+  releasing the same veth or cgroup at the same time is the ordinary case here,
+  not a race to be prevented.
 
 ---
 
@@ -403,6 +540,15 @@ overriding them:
 8. **Root-requiring code paths are isolated and clearly marked** (build tags
    or explicit capability checks) so unit tests never accidentally require
    root.
+9. **The Forge process never permanently leaves the host's namespaces.**
+   `setns(2)` moves the calling thread, so every join happens on a thread that
+   is locked to one goroutine, never unlocked, and destroyed when that
+   goroutine returns — and never on the process's initial thread, which the Go
+   runtime parks instead of terminating and whose namespaces `/proc/self`
+   reports. Only the `exec`'d child joins a container; the long-lived runtime
+   does not. A regression here is silent, intermittent, and corrupts every
+   later operation in the same process, which is why it is an invariant rather
+   than a code comment (see `internal/runtime/exec.go`).
 
 ---
 
@@ -445,36 +591,60 @@ What did we decide?
 What becomes easier or harder as a result?
 ```
 
-### Recorded ADRs (to be created as the project proceeds)
+### Recorded ADRs
 
-| ID | Title | Status |
-|---|---|---|
-| 0001 | Use `pivot_root` instead of `chroot` for rootfs isolation | Accepted |
-| 0002 | Use direct cgroups v2 filesystem writes instead of a cgroups library | Proposed |
-| 0003 | Layer assembly strategy: OverlayFS vs. explicit layer extraction | Accepted |
-| 0004 | CLI flag library choice (stdlib `flag` vs. `cobra`) | Accepted |
-| 0005 | Container ID generation scheme | Accepted |
-| 0006 | State store format (JSON files vs. embedded DB) | Proposed |
-| 0007 | Introduce `internal/runtime` in Stage 1 | Accepted |
-| 0008 | Child-side namespace setup via re-executing `/proc/self/exe` | Accepted |
-| 0009 | `forge run` output streams and exit status | Accepted |
-| 0010 | Per-container rootfs layout, and how Stage 2 populates it | Accepted |
-| 0011 | The mount plan is built by `runtime` and executed by `mount` | Accepted |
-| 0012 | All container mounts are made child-side, before `pivot_root` | Accepted |
-| 0013 | Depend on `golang.org/x/sys/unix` for syscalls | Accepted |
-| 0020 | One `internal/image` package, and no primitive-to-primitive edges | Accepted |
-| 0021 | The layer cache is a content-addressed blob store | Accepted |
-| 0022 | `forge run` positional grammar and command resolution from an image | Proposed |
+`File` says whether `docs/adr/NNNN-*.md` exists. A decision that is cited by the
+code but has no file is a documentation debt, not an undecided question — the
+decision was made and implemented; only the record is missing.
 
-Each must be filled in and marked `Accepted` before the corresponding stage's
-implementation is merged.
+| ID | Title | Status | File |
+|---|---|---|---|
+| 0001 | Use `pivot_root` instead of `chroot` for rootfs isolation | Accepted | ✅ |
+| 0002 | Use direct cgroups v2 filesystem writes instead of a cgroups library | Accepted, implemented | ❌ |
+| 0003 | Layer assembly strategy: OverlayFS vs. explicit layer extraction | Accepted | ✅ |
+| 0004 | CLI flag library choice (stdlib `flag` vs. `cobra`) | Accepted | ✅ |
+| 0005 | Container ID generation scheme | Accepted | ✅ |
+| 0006 | State store format (JSON files vs. embedded DB) | Accepted, implemented | ❌ |
+| 0007 | Introduce `internal/runtime` in Stage 1 | Accepted | ✅ |
+| 0008 | Child-side namespace setup via re-executing `/proc/self/exe` | Accepted | ✅ |
+| 0009 | `forge run` output streams and exit status | Accepted | ✅ |
+| 0010 | Per-container rootfs layout, and how Stage 2 populates it | Accepted | ✅ |
+| 0011 | The mount plan is built by `runtime` and executed by `mount` | Accepted | ✅ |
+| 0012 | All container mounts are made child-side, before `pivot_root` | Accepted | ✅ |
+| 0013 | Depend on `golang.org/x/sys/unix` for syscalls | Accepted | ✅ |
+| 0014 | The cgroup attach happens in the handshake window, between `Start` and `writePayload` | Accepted, implemented | ❌ |
+| 0015 | Degradation policy when the cgroup v2 unified hierarchy is unavailable | Accepted, implemented | ❌ |
+| 0016 | Netlink is spoken directly, with no netlink library | Accepted, implemented | ❌ |
+| 0017 | NAT via nf_tables over `NETLINK_NETFILTER`, not `iptables` | Accepted, implemented | ❌ |
+| 0018 | The container configures its own interface from plain data across the re-exec boundary | Accepted, implemented | ❌ |
+| 0019 | Interface names and IP leases are derived from the container ID | Accepted, implemented | ❌ |
+| 0020 | One `internal/image` package, and no primitive-to-primitive edges | Accepted | ✅ |
+| 0021 | The layer cache is a content-addressed blob store | Accepted | ✅ |
+| 0022 | `forge run` positional grammar and command resolution from an image | Accepted, implemented | ❌ |
 
-IDs 0014–0019 are unallocated. Stages 3 and 4 were merged without recording
-ADRs, and their decisions are documented in `docs/stages/` only; the numbers are
-left free so those records can be written retroactively without renumbering.
-0022 stays `Proposed` until `forge run <image>` is wired through
-`internal/runtime` and `internal/cli`, which Stage 5's package work deliberately
-leaves for a following change.
+**Outstanding documentation debt.** Nine decisions above have no ADR file.
+0002 and 0006 were marked `Proposed` and then simply implemented. 0014–0019
+were described here as "unallocated" while Stage 4 went ahead and cited
+0016–0019 from `internal/network` and `internal/runtime`, so the numbers are
+now spoken for by the code whether or not the records exist. 0022 was to stay
+`Proposed` until `forge run <image>` was wired through `internal/runtime` and
+`internal/cli`; that shipped in Stage 5, and the status was never updated.
+
+**One number is claimed twice.** `docs/stages/stage-3.md` uses 0015 for the
+cgroup-v2 degradation policy, and `docs/stages/stage-6.md` says `forge exec`'s
+thread discipline "needs ADR-0015". Both cannot have it. Whoever writes these
+records should give the exec decision the next free number — it is the more
+consequential of the two, and it is the one with rejected alternatives worth
+recording: a cgo prelude, and a persistent in-container agent.
+
+Writing those nine is the largest known gap between this document and the
+codebase. It changes no behaviour, and `docs/stages/` covers most of the
+reasoning in narrative form in the meantime. `docs/stages/stage-4.md` is also
+absent, which is why Stage 4's decisions are the least well recorded of the
+six.
+
+For any *future* change, the original rule stands: an ADR must be filled in and
+marked `Accepted` before the corresponding implementation is merged.
 
 ---
 
