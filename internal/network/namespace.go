@@ -38,7 +38,7 @@ import (
 // cannot have been recycled underneath us.
 func moveLinkToNetns(c *nlConn, index int32, pid int) error {
 	body := concat(
-		ifInfoMsg(unix.AF_UNSPEC, index, 0, 0),
+		ifInfoMsg(index, 0, 0),
 		nlAttrU32(unix.IFLA_NET_NS_PID, uint32(pid)),
 	)
 
@@ -69,7 +69,7 @@ func moveLinkToNetns(c *nlConn, index int32, pid int) error {
 //  3. MTU, if one was asked for. Cheap while the link is still down.
 //  4. address, then up, then the default route. The route needs the interface
 //     up and addressed, or the kernel has no path to attach it to.
-func Configure(iface Interface) error {
+func Configure(iface Interface) (err error) {
 	if err := iface.Validate(); err != nil {
 		return err
 	}
@@ -78,7 +78,14 @@ func Configure(iface Interface) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.close() }()
+	// The container has no logger to warn through — this runs between clone(2)
+	// and execve — so a socket that will not close is reported as the failure
+	// it is, but only when nothing more interesting has already gone wrong.
+	defer func() {
+		if closeErr := conn.close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	if err := configureLoopback(conn); err != nil {
 		return err
@@ -125,12 +132,17 @@ func Configure(iface Interface) error {
 // It is what a container in ModeNone gets: its own network namespace, isolated
 // from every other, but still able to talk to itself. Without it such a
 // container cannot even connect to 127.0.0.1, which surprises everyone once.
-func ConfigureLoopback() error {
+func ConfigureLoopback() (err error) {
 	conn, err := dialNetlink(unix.NETLINK_ROUTE)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.close() }()
+	// See Configure: the same reasoning about a close that fails applies here.
+	defer func() {
+		if closeErr := conn.close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	return configureLoopback(conn)
 }

@@ -35,7 +35,7 @@ func natManager(t *testing.T, bridge, subnet string) *Manager {
 func TestNfgenMsgLayout(t *testing.T) {
 	t.Parallel()
 
-	body := nfgenMsg(nfProtoIPv4, nfnetlinkV0, nfnlSubsysNFTables)
+	body := nfgenMsg(nfProtoIPv4, nfnlSubsysNFTables)
 
 	if len(body) != 4 {
 		t.Fatalf("length = %d, want 4", len(body))

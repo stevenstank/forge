@@ -447,3 +447,38 @@ func TestConfigEnviron(t *testing.T) {
 		t.Errorf("Environ(nil) = %v, want the image's own environment", got)
 	}
 }
+
+// TestPlatformIsZero covers the distinction Stage 5 needs when an image config
+// declares nothing: "declares a platform that does not match" is a refusal,
+// "declares nothing" is not.
+func TestPlatformIsZero(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		p    image.Platform
+		want bool
+	}{
+		{name: "empty", p: image.Platform{}, want: true},
+		{name: "a variant alone is not a platform", p: image.Platform{Variant: "v8"}, want: true},
+		{name: "os only", p: image.Platform{OS: "linux"}, want: false},
+		{name: "architecture only", p: image.Platform{Architecture: "arm64"}, want: false},
+		{name: "both", p: image.Platform{OS: "linux", Architecture: "amd64"}, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tc.p.IsZero(); got != tc.want {
+				t.Errorf("Platform%+v.IsZero() = %t, want %t", tc.p, got, tc.want)
+			}
+		})
+	}
+
+	// The host's own platform is never zero, which is what makes the check
+	// usable as "the image said nothing" rather than "something went wrong".
+	if image.HostPlatform().IsZero() {
+		t.Error("HostPlatform().IsZero() = true")
+	}
+}

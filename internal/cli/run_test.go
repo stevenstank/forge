@@ -527,3 +527,46 @@ func TestIsUserErrorClassifiesImageFailures(t *testing.T) {
 		}
 	}
 }
+
+// TestMountListFlagValue covers the flag.Value behind repeated -mount flags.
+//
+// String is what `forge run -h` prints as the flag's current value, and a nil
+// or empty list must not print a stray separator; Set is where a malformed
+// spec is caught, with the flag that carried it.
+func TestMountListFlagValue(t *testing.T) {
+	t.Parallel()
+
+	var list mountList
+
+	if got := list.String(); got != "" {
+		t.Errorf("empty String() = %q, want empty", got)
+	}
+
+	var nilList *mountList
+	if got := nilList.String(); got != "" {
+		t.Errorf("nil String() = %q, want empty", got)
+	}
+
+	if err := list.Set("/srv/data:/data"); err != nil {
+		t.Fatalf("Set() = %v", err)
+	}
+	if err := list.Set("/srv/etc:/etc:ro"); err != nil {
+		t.Fatalf("Set() = %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("list has %d mounts, want 2", len(list))
+	}
+	if got, want := list.String(), "/srv/data:/data /srv/etc:/etc"; got != want {
+		t.Errorf("String() = %q, want %q", got, want)
+	}
+
+	// A malformed spec is refused and nothing is appended, so a later error
+	// message cannot name a mount the user never successfully gave.
+	before := len(list)
+	if err := list.Set("not-a-mount-spec"); err == nil {
+		t.Error("Set(\"not-a-mount-spec\") = nil, want an error")
+	}
+	if len(list) != before {
+		t.Errorf("a refused spec was appended: %v", list)
+	}
+}

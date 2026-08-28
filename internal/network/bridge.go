@@ -35,7 +35,7 @@ import (
 //	  IFLA_INFO_KIND  = "bridge"
 func bridgeCreateMessage(name string) []byte {
 	return concat(
-		ifInfoMsg(unix.AF_UNSPEC, 0, 0, 0),
+		ifInfoMsg(0, 0, 0),
 		nlAttrString(unix.IFLA_IFNAME, name),
 		nlNestedPlain(unix.IFLA_LINKINFO,
 			nlAttrString(unix.IFLA_INFO_KIND, "bridge"),

@@ -975,3 +975,29 @@ func TestFilePermissions(t *testing.T) {
 		t.Errorf("log directory mode = %#o, want %#o", perm, 0o700)
 	}
 }
+
+// TestStoreDirReportsWhereItWrites pins the accessor `forge rm` and the runtime
+// use to name a container's log in an error, and the cleaning New applies to it.
+func TestStoreDirReportsWhereItWrites(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	store, err := logs.New(dir)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	if got := store.Dir(); got != dir {
+		t.Errorf("Dir() = %q, want %q", got, dir)
+	}
+
+	// A path spelled with a trailing separator, or with a redundant "." in it,
+	// names the same directory and must be reported the one way.
+	store, err = logs.New(dir + "/./")
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	if got := store.Dir(); got != dir {
+		t.Errorf("Dir() = %q, want it cleaned to %q", got, dir)
+	}
+}

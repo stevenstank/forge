@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -149,5 +150,74 @@ func TestPrepareNetworkWithoutAVethNeverReachesIPAM(t *testing.T) {
 	}
 	if len(cleanup.fns) != 0 {
 		t.Errorf("cleanup stack has %d steps, want none", len(cleanup.fns))
+	}
+}
+
+// TestContainerNetworkIface covers what crosses the re-exec boundary
+// (ADR-0018): the container configures itself from this description, and a nil
+// one is how "you have no interface to configure" is said.
+func TestContainerNetworkIface(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cnet containerNetwork
+		want bool
+	}{
+		{name: "host mode", cnet: containerNetwork{mode: network.ModeHost}, want: false},
+		{name: "none mode", cnet: containerNetwork{mode: network.ModeNone}, want: false},
+		{
+			name: "bridge mode with an allocation",
+			cnet: containerNetwork{
+				mode: network.ModeBridge,
+				alloc: &network.Network{
+					ContainerID: "7f3c9a1b2d04",
+					HostVeth:    "fvh7f3c9a1b2d04",
+					PeerVeth:    "fvc7f3c9a1b2d04",
+					Interface: network.Interface{
+						Source:  "fvc7f3c9a1b2d04",
+						Name:    network.ContainerIfaceName,
+						Address: "10.99.0.2/16",
+						Gateway: "10.99.0.1",
+					},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tc.cnet.iface()
+			if (got != nil) != tc.want {
+				t.Fatalf("iface() = %v, want non-nil == %t", got, tc.want)
+			}
+			if !tc.want {
+				return
+			}
+			if got.Address != tc.cnet.alloc.Interface.Address {
+				t.Errorf("address = %q, want %q", got.Address, tc.cnet.alloc.Interface.Address)
+			}
+			if err := got.Validate(); err != nil {
+				t.Errorf("the interface handed to the container does not validate: %v", err)
+			}
+		})
+	}
+}
+
+// TestAttachNetworkNeverTouchesTheKernelWithoutAnAllocation is the guard that
+// keeps a host-networked container out of internal/network entirely: attaching
+// one would plug the host's namespace into Forge's bridge.
+func TestAttachNetworkNeverTouchesTheKernelWithoutAnAllocation(t *testing.T) {
+	t.Parallel()
+
+	r := newNetworkTestRunner(t)
+
+	for _, mode := range []network.Mode{network.ModeHost, network.ModeNone} {
+		if err := r.attachNetwork(discardLogger(), containerNetwork{mode: mode}, os.Getpid()); err != nil {
+			t.Errorf("attachNetwork(%s) = %v, want nil", mode, err)
+		}
 	}
 }

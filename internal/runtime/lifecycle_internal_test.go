@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -116,9 +117,9 @@ func testRunner(t *testing.T, proc *fakeProcess) *Runner {
 		t.Fatalf("NewRunner() = %v", err)
 	}
 
-	var opens int
+	// No call counter here: nothing reads one, and two `forge stop`s racing
+	// each other would race on it rather than on anything in the runtime.
 	r.openProcess = func(int) (containerProcess, error) {
-		opens++
 		if proc == nil {
 			return nil, process.ErrNoProcess
 		}
@@ -911,4 +912,132 @@ func TestStopHonoursContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Stop() = %v, want context.Canceled", err)
 	}
+}
+
+// TestConcurrentStopsOfOneContainer is the shape two terminals produce: a
+// `forge stop` in each, against the same container, at the same moment.
+//
+// Both must succeed. Stop is documented as idempotent, and the resources it
+// releases — the network lease, the cgroup — are released by the supervising
+// `forge run` on its way out as well, so two processes releasing the same thing
+// concurrently is the ordinary case here rather than a race to be prevented.
+func TestConcurrentStopsOfOneContainer(t *testing.T) {
+	t.Parallel()
+
+	proc := &fakeProcess{alive: true, dieOn: syscall.SIGTERM}
+	r := testRunner(t, proc)
+
+	const id = "7f3c9a1b2d04"
+	seed(t, r, runningRecord(id))
+	prepareCgroupLeaf(t, r, id)
+
+	const stoppers = 8
+
+	var wg sync.WaitGroup
+	errs := make([]error, stoppers)
+	start := make(chan struct{})
+
+	for i := range stoppers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = r.Stop(t.Context(), id, StopOptions{Timeout: 50 * time.Millisecond})
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("stopper %d = %v, want nil", i, err)
+		}
+	}
+
+	m := load(t, r, id)
+	if !m.Status.Terminal() {
+		t.Errorf("status = %s, want a terminal status", m.Status)
+	}
+
+	// The cgroup is gone exactly once, and no stopper reported the second
+	// removal as a failure.
+	assertGone(t, filepath.Join(r.cgroups.Root(), id), "the container cgroup")
+}
+
+// TestConcurrentReleaseIsIdempotent isolates the same property one level down,
+// where the supervising run and a `forge stop` meet.
+func TestConcurrentReleaseIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	r := testRunner(t, nil)
+
+	const id = "7f3c9a1b2d04"
+	prepareCgroupLeaf(t, r, id)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	start := make(chan struct{})
+
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = r.releaseRuntimeResources(discardLogger(), id)
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("releaser %d = %v, want nil", i, err)
+		}
+	}
+}
+
+// TestConcurrentListWhileContainersAreRemoved covers `forge ps` running against
+// a state directory that another process is changing underneath it. A record
+// that goes while the listing is walking is not an error: it is a container
+// that stopped, which is what ps is there to notice.
+func TestConcurrentListWhileContainersAreRemoved(t *testing.T) {
+	t.Parallel()
+
+	r := testRunner(t, nil)
+
+	const containers = 16
+	ids := make([]string, containers)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("c%011d", i)
+		m := runningRecord(ids[i])
+		m.Status = state.StatusExited
+		seed(t, r, m)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for _, id := range ids {
+			if err := r.state.Remove(id); err != nil {
+				t.Errorf("Remove(%s) = %v", id, err)
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for range 50 {
+			if _, errs := r.List(true); len(errs) > 0 {
+				t.Errorf("List() = %v", errs)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
 }

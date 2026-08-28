@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/stevenstank/forge/internal/cgroup"
@@ -434,10 +433,7 @@ func newInitCommand() Command {
 // execInit runs the container's init. It returns only on failure; on success
 // execve has already replaced the process.
 func execInit(_ context.Context, _ *Env, _ []string) error {
-	if err := runtime.Init(); err != nil {
-		return &ExitError{Code: runtime.InitExitCode, Err: err}
-	}
-
-	// Unreachable in practice: Init either fails or never returns.
-	return &ExitError{Code: runtime.InitExitCode, Err: os.ErrInvalid}
+	// Init only ever returns a failure — on success execve has already replaced
+	// this process — so there is no success branch here to write.
+	return &ExitError{Code: runtime.InitExitCode, Err: runtime.Init()}
 }

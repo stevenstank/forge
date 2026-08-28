@@ -379,10 +379,13 @@ func concat(parts ...[]byte) []byte {
 
 // ifInfoMsg encodes struct ifinfomsg, the header every RTM_*LINK message
 // carries.
-func ifInfoMsg(family uint8, index int32, flags, change uint32) []byte {
+//
+// ifi_family is always AF_UNSPEC: it is vestigial for link messages, which the
+// kernel dispatches on the message type rather than on the address family.
+func ifInfoMsg(index int32, flags, change uint32) []byte {
 	buf := make([]byte, ifInfoMsgLen)
 
-	buf[0] = family
+	buf[0] = unix.AF_UNSPEC
 	// buf[1] is __ifi_pad, and buf[2:4] is ifi_type, both left zero.
 	order.PutUint32(buf[4:8], uint32(index))
 	order.PutUint32(buf[8:12], flags)
@@ -465,8 +468,10 @@ func dialNetlink(protocol int) (*nlConn, error) {
 	}
 
 	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("binding the netlink socket: %w", translate(err))
+		return nil, errors.Join(
+			fmt.Errorf("binding the netlink socket: %w", translate(err)),
+			closeSocket(fd),
+		)
 	}
 
 	// Every request Forge sends carries NLM_F_ACK, so the kernel answers
@@ -477,8 +482,10 @@ func dialNetlink(protocol int) (*nlConn, error) {
 	// is an error naming the operation that hung.
 	timeout := unix.NsecToTimeval(int64(netlinkReplyTimeout))
 	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("setting the netlink receive timeout: %w", translate(err))
+		return nil, errors.Join(
+			fmt.Errorf("setting the netlink receive timeout: %w", translate(err)),
+			closeSocket(fd),
+		)
 	}
 
 	return &nlConn{fd: fd}, nil
@@ -491,8 +498,13 @@ func dialNetlink(protocol int) (*nlConn, error) {
 const netlinkReplyTimeout = 10 * time.Second
 
 // close releases the socket.
-func (c *nlConn) close() error {
-	if err := unix.Close(c.fd); err != nil {
+func (c *nlConn) close() error { return closeSocket(c.fd) }
+
+// closeSocket releases a netlink descriptor, named separately so the paths in
+// dialNetlink that abandon a half-configured socket report a failure to let go
+// of it the same way every other caller does.
+func closeSocket(fd int) error {
+	if err := unix.Close(fd); err != nil {
 		return fmt.Errorf("closing the netlink socket: %w", err)
 	}
 	return nil
@@ -637,7 +649,7 @@ func linkExists(name string) bool {
 
 // setLinkUp brings an interface up.
 func setLinkUp(c *nlConn, index int32) error {
-	body := ifInfoMsg(unix.AF_UNSPEC, index, unix.IFF_UP, unix.IFF_UP)
+	body := ifInfoMsg(index, unix.IFF_UP, unix.IFF_UP)
 	if err := c.execute(unix.RTM_NEWLINK, 0, body); err != nil {
 		return fmt.Errorf("bringing interface %d up: %w", index, err)
 	}
@@ -647,7 +659,7 @@ func setLinkUp(c *nlConn, index int32) error {
 // setLinkMTU sets an interface's MTU.
 func setLinkMTU(c *nlConn, index int32, mtu int) error {
 	body := concat(
-		ifInfoMsg(unix.AF_UNSPEC, index, 0, 0),
+		ifInfoMsg(index, 0, 0),
 		nlAttrU32(unix.IFLA_MTU, uint32(mtu)),
 	)
 	if err := c.execute(unix.RTM_NEWLINK, 0, body); err != nil {
@@ -659,7 +671,7 @@ func setLinkMTU(c *nlConn, index int32, mtu int) error {
 // setLinkMaster enslaves an interface to a bridge.
 func setLinkMaster(c *nlConn, index, master int32) error {
 	body := concat(
-		ifInfoMsg(unix.AF_UNSPEC, index, 0, 0),
+		ifInfoMsg(index, 0, 0),
 		nlAttrU32(unix.IFLA_MASTER, uint32(master)),
 	)
 	if err := c.execute(unix.RTM_NEWLINK, 0, body); err != nil {
@@ -673,7 +685,7 @@ func setLinkMaster(c *nlConn, index, master int32) error {
 // it rather than after.
 func renameLink(c *nlConn, index int32, name string) error {
 	body := concat(
-		ifInfoMsg(unix.AF_UNSPEC, index, 0, 0),
+		ifInfoMsg(index, 0, 0),
 		nlAttrString(unix.IFLA_IFNAME, name),
 	)
 	if err := c.execute(unix.RTM_NEWLINK, 0, body); err != nil {
@@ -685,7 +697,7 @@ func renameLink(c *nlConn, index int32, name string) error {
 // deleteLink removes an interface. Deleting either end of a veth pair removes
 // both, which is why teardown only ever names the host end.
 func deleteLink(c *nlConn, index int32) error {
-	body := ifInfoMsg(unix.AF_UNSPEC, index, 0, 0)
+	body := ifInfoMsg(index, 0, 0)
 	if err := c.execute(unix.RTM_DELLINK, 0, body); err != nil {
 		return fmt.Errorf("deleting interface %d: %w", index, err)
 	}

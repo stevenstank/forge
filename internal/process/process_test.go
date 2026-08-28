@@ -68,7 +68,10 @@ func helperConfig(t *testing.T, mode string, env ...string) process.Config {
 	return process.Config{
 		Path: exe,
 		Args: []string{"forge-test-helper"},
-		Env:  append([]string{helperEnv + "=" + mode}, env...),
+		// GOCOVERDIR silences the warning a -cover build writes to stderr as
+		// it exits. Without it a coverage run turns the stderr assertions
+		// below into failures that have nothing to do with the code.
+		Env: append([]string{helperEnv + "=" + mode, "GOCOVERDIR=" + t.TempDir()}, env...),
 	}
 }
 

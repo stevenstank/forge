@@ -321,3 +321,65 @@ func TestValidateSourceNamesThePath(t *testing.T) {
 		t.Errorf("error %q does not name the path", err)
 	}
 }
+
+// TestLookupRefusesSomethingThatIsNotADirectory covers the case a stray file in
+// the store produces: `forge rm` must say the container was never prepared
+// rather than trying to treat a regular file as a container tree.
+func TestLookupRefusesSomethingThatIsNotADirectory(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "containers")
+	store, err := rootfs.NewStore(root, logging.New(io.Discard, slog.LevelError))
+	if err != nil {
+		t.Fatalf("NewStore() = %v", err)
+	}
+
+	const id = "a1b2c3d4e5f6"
+	if err := os.WriteFile(filepath.Join(root, id), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.Lookup(id)
+	if !errors.Is(err, rootfs.ErrNotPrepared) {
+		t.Fatalf("Lookup() = %v, want ErrNotPrepared", err)
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("Lookup() = %q, want it to say what is wrong", err)
+	}
+}
+
+// TestPrepareReportsAnUnwritableStore checks the error a run gets when Forge's
+// storage root cannot be written to, which is what an operator meets on a full
+// or read-only filesystem.
+func TestPrepareReportsAnUnwritableStore(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so this asserts nothing as root")
+	}
+
+	root := filepath.Join(t.TempDir(), "containers")
+	store, err := rootfs.NewStore(root, logging.New(io.Discard, slog.LevelError))
+	if err != nil {
+		t.Fatalf("NewStore() = %v", err)
+	}
+
+	if err := os.Chmod(root, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
+
+	const id = "a1b2c3d4e5f6"
+
+	_, err = store.Prepare(id)
+	if err == nil {
+		t.Fatal("Prepare() = nil into an unwritable store")
+	}
+	if !strings.Contains(err.Error(), id) {
+		t.Errorf("Prepare() = %q, want it to name the container directory", err)
+	}
+	// Nothing half-built is left behind (PRD NFR-8).
+	if _, statErr := os.Stat(filepath.Join(root, id)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("a failed Prepare left %s behind", filepath.Join(root, id))
+	}
+}

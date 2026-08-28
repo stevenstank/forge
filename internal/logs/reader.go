@@ -280,7 +280,7 @@ func parseEntry(line []byte) (Entry, error) {
 		return Entry{}, fmt.Errorf("%w: unknown stream %q", ErrCorruptEntry, string(wire.Stream))
 	}
 
-	return Entry{Time: wire.Time, Stream: wire.Stream, Message: wire.Message}, nil
+	return Entry(wire), nil
 }
 
 // Close releases the reader's descriptor.

@@ -356,8 +356,14 @@ func (m *Manager) tryClaim(taken map[string]bool, containerID string) (string, b
 		closeErr := f.Close()
 		if writeErr != nil || closeErr != nil {
 			// A lease that does not name its owner cannot be verified or
-			// reclaimed later, so it is worse than no lease at all.
-			_ = os.Remove(m.leasePath(ip))
+			// reclaimed later, so it is worse than no lease at all. If it
+			// cannot be removed either, the address is lost to the pool until
+			// something cleans the directory up, which is worth a word.
+			if rmErr := os.Remove(m.leasePath(ip)); rmErr != nil &&
+				!errors.Is(rmErr, os.ErrNotExist) && m.logger != nil {
+				m.logger.Warn("could not remove an unwritable lease file",
+					"address", ip, "error", rmErr)
+			}
 			return "", false
 		}
 

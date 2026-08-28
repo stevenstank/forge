@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stevenstank/forge/internal/image"
 )
@@ -618,4 +619,113 @@ func TestWellFormedWhiteoutsStillApply(t *testing.T) {
 func destDirAt(t *testing.T, dir string) string {
 	t.Helper()
 	return dir
+}
+
+// layerModTime is what buildTar stamps on every entry.
+var layerModTime = time.Unix(1600000000, 0)
+
+// TestUnpackLayerRestoresModificationTimes checks the metadata pass that runs
+// after the bytes are written.
+//
+// A directory's timestamp is the interesting one: writing an entry into a
+// directory updates that directory's mtime, so restoring it eagerly would be
+// undone by the very next entry. The deferred pass is what makes the extracted
+// tree match the image rather than the moment it was unpacked.
+func TestUnpackLayerRestoresModificationTimes(t *testing.T) {
+	t.Parallel()
+
+	cache := newCache(t)
+	dest := destDir(t)
+
+	layer := buildLayer(t,
+		dir("etc"),
+		file("etc/hosts", "127.0.0.1 localhost\n"),
+		file("etc/passwd", "root:x:0:0:root:/root:/bin/sh\n"),
+		symlink("etc/hostname", "hosts"),
+	)
+
+	if _, err := unpackInto(t, cache, dest, layer); err != nil {
+		t.Fatalf("UnpackLayer() = %v", err)
+	}
+
+	for _, path := range []string{"etc", "etc/hosts", "etc/passwd"} {
+		info, err := os.Stat(filepath.Join(dest, path))
+		if err != nil {
+			t.Fatalf("stat %s = %v", path, err)
+		}
+		if !info.ModTime().Equal(layerModTime) {
+			t.Errorf("%s mtime = %s, want %s", path, info.ModTime().UTC(), layerModTime.UTC())
+		}
+	}
+
+	// The symlink's own timestamp, not its target's. Following it would set
+	// the target's time instead and leave the link untouched.
+	info, err := os.Lstat(filepath.Join(dest, "etc/hostname"))
+	if err != nil {
+		t.Fatalf("lstat = %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("etc/hostname is not a symlink")
+	}
+	if !info.ModTime().Equal(layerModTime) {
+		t.Errorf("symlink mtime = %s, want %s", info.ModTime().UTC(), layerModTime.UTC())
+	}
+}
+
+// TestUnpackLayerRestoresTimesOnARestrictedDirectory is the two deferred
+// concerns together: a directory that is unwritable in the image still receives
+// its contents, and still ends with both the mode and the timestamp the image
+// declared.
+func TestUnpackLayerRestoresTimesOnARestrictedDirectory(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so this asserts nothing as root")
+	}
+
+	cache := newCache(t)
+	dest := destDir(t)
+
+	layer := buildLayer(t,
+		entry{name: "locked", typ: tar.TypeDir, mode: 0o500},
+		file("locked/inside", "written anyway"),
+	)
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dest, "locked"), 0o700) })
+
+	if _, err := unpackInto(t, cache, dest, layer); err != nil {
+		t.Fatalf("UnpackLayer() = %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dest, "locked"))
+	if err != nil {
+		t.Fatalf("stat = %v", err)
+	}
+	if info.Mode().Perm() != 0o500 {
+		t.Errorf("mode = %v, want 0500", info.Mode().Perm())
+	}
+	if !info.ModTime().Equal(layerModTime) {
+		t.Errorf("mtime = %s, want %s", info.ModTime().UTC(), layerModTime.UTC())
+	}
+}
+
+// TestLaterLayersReplaceMetadataToo checks that an entry rewritten by a later
+// layer carries the later layer's metadata, not a merge of the two.
+func TestLaterLayersReplaceMetadataToo(t *testing.T) {
+	t.Parallel()
+
+	cache := newCache(t)
+	dest := destDir(t)
+
+	first := buildLayer(t, entry{name: "tool", typ: tar.TypeReg, body: "v1", mode: 0o644})
+	second := buildLayer(t, entry{name: "tool", typ: tar.TypeReg, body: "v2", mode: 0o755})
+
+	if _, err := unpackInto(t, cache, dest, first); err != nil {
+		t.Fatalf("UnpackLayer(first) = %v", err)
+	}
+	if _, err := unpackInto(t, cache, dest, second); err != nil {
+		t.Fatalf("UnpackLayer(second) = %v", err)
+	}
+
+	assertFile(t, filepath.Join(dest, "tool"), "v2")
+	assertMode(t, filepath.Join(dest, "tool"), 0o755)
 }

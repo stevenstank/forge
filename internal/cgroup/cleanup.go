@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -126,8 +127,14 @@ func evict(dir string) error {
 			continue
 		}
 		// A process that exited between the read and here is the outcome this
-		// wanted, so "already finished" is not a failure.
-		_ = process.Signal(os.Kill)
+		// wanted, so "already finished" is not a failure. Anything else — a
+		// permission error, most plausibly — means the cgroup cannot be
+		// emptied, and saying so beats retrying until the budget runs out and
+		// reporting the survivors without a reason.
+		if err := process.Signal(os.Kill); err != nil &&
+			!errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("killing process %d in cgroup %s: %w", pid, dir, translate(err))
+		}
 	}
 
 	return nil

@@ -111,7 +111,11 @@ func RemoveForgeCgroupIfEmpty(t *testing.T) {
 	t.Helper()
 
 	if len(Leaves(t)) == 0 {
-		_ = os.Remove(ForgeCgroup)
+		// A cgroup that another test's container has just entered, or that a
+		// concurrent run recreated, is not this helper's to insist on.
+		if err := os.Remove(ForgeCgroup); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Logf("leaving %s in place: %v", ForgeCgroup, err)
+		}
 	}
 }
 
@@ -438,7 +442,9 @@ func StartLiveWithRunner(ctx context.Context, t *testing.T, runner *runtime.Runn
 		// The child holds its own descriptor for the read end; this is the
 		// parent's copy, closed once the container is gone so a long suite does
 		// not accumulate one open pipe per test.
-		_ = live.reader.Close()
+		if err := live.reader.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Errorf("closing the parent's copy of the container's stdin pipe: %v", err)
+		}
 		if out := live.Stdout.String(); out != "" {
 			t.Logf("container stdout:\n%s", out)
 		}
@@ -519,7 +525,11 @@ func (l *Live) Wait(t *testing.T, timeout time.Duration) process.Status {
 func (l *Live) stop(t *testing.T) {
 	t.Helper()
 
-	_ = l.stdin.Close()
+	// stop is idempotent, so a test that already ended the container cleanly
+	// finds the write end closed; anything else failed for a real reason.
+	if err := l.stdin.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		t.Errorf("closing the container's stdin: %v", err)
+	}
 
 	select {
 	case <-l.done:

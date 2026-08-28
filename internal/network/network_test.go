@@ -17,7 +17,7 @@ func TestModeValidate(t *testing.T) {
 	}
 
 	for _, mode := range []network.Mode{"", "brige", "container", "HOST"} {
-		if err := network.Mode(mode).Validate(); err == nil {
+		if err := mode.Validate(); err == nil {
 			t.Errorf("Mode(%q).Validate() = nil, want an error", mode)
 		}
 	}

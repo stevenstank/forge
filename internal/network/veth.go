@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -105,12 +106,12 @@ func validateIfaceName(name string) error {
 //	      IFLA_IFNAME        = peer
 func vethCreateMessage(host, peer string) []byte {
 	peerBlock := nlNestedPlain(vethInfoPeer,
-		ifInfoMsg(unix.AF_UNSPEC, 0, 0, 0),
+		ifInfoMsg(0, 0, 0),
 		nlAttrString(unix.IFLA_IFNAME, peer),
 	)
 
 	return concat(
-		ifInfoMsg(unix.AF_UNSPEC, 0, 0, 0),
+		ifInfoMsg(0, 0, 0),
 		nlAttrString(unix.IFLA_IFNAME, host),
 		nlNestedPlain(unix.IFLA_LINKINFO,
 			nlAttrString(unix.IFLA_INFO_KIND, "veth"),
@@ -150,8 +151,11 @@ func createVethPair(c *nlConn, host, peer string) error {
 // peer is gone is gone too.
 func deleteVeth(c *nlConn, name string) error {
 	index, err := linkIndex(name)
-	if err != nil {
+	if errors.Is(err, ErrNotFound) {
 		return nil
+	}
+	if err != nil {
+		return err
 	}
 
 	if err := deleteLink(c, index); err != nil {

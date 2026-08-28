@@ -291,7 +291,7 @@ func validateTag(tag, original string) error {
 		return fmt.Errorf("%w: %q: tag is %d characters, the limit is %d",
 			ErrInvalidReference, original, len(tag), maxTagLength)
 	}
-	if first := tag[0]; !isAlphanumeric(first) && first != '_' && !(first >= 'A' && first <= 'Z') {
+	if first := tag[0]; !isAlphanumeric(first) && first != '_' && (first < 'A' || first > 'Z') {
 		return fmt.Errorf("%w: %q: a tag must begin with a letter, digit or underscore",
 			ErrInvalidReference, original)
 	}

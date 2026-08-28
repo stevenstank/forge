@@ -328,7 +328,7 @@ func TestOnDisposableThreadStepsOffTheMainThread(t *testing.T) {
 func TestOnDisposableThreadReturnsTheOutcome(t *testing.T) {
 	want := errors.New("the command could not be started")
 
-	if got := onDisposableThread(func() execOutcome { return execOutcome{err: want} }); got.err != want {
+	if got := onDisposableThread(func() execOutcome { return execOutcome{err: want} }); !errors.Is(got.err, want) {
 		t.Errorf("err = %v, want %v", got.err, want)
 	}
 
@@ -344,7 +344,7 @@ func TestOnDisposableThreadReturnsTheOutcome(t *testing.T) {
 		return false
 	}
 
-	if got := onDisposableThread(func() execOutcome { return execOutcome{err: want} }); got.err != want {
+	if got := onDisposableThread(func() execOutcome { return execOutcome{err: want} }); !errors.Is(got.err, want) {
 		t.Errorf("err through the main-thread path = %v, want %v", got.err, want)
 	}
 }

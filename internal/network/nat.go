@@ -201,11 +201,13 @@ func enableIPForward() error {
 // resID is big-endian even on a little-endian host: nfnetlink fixes the byte
 // order of this field regardless of the machine, which is exactly the sort of
 // detail that produces an EINVAL with no explanation.
-func nfgenMsg(family, version uint8, resID uint16) []byte {
+func nfgenMsg(family uint8, resID uint16) []byte {
 	buf := make([]byte, 4)
 
 	buf[0] = family
-	buf[1] = version
+	// nfnetlink has only ever had one header version, and every message Forge
+	// sends carries it.
+	buf[1] = nfnetlinkV0
 	buf[2] = byte(resID >> 8)
 	buf[3] = byte(resID)
 
@@ -219,7 +221,7 @@ func nftMsgType(msg uint16) uint16 { return nfnlSubsysNFTables<<8 | msg }
 // natTableMessage builds the body of an NFT_MSG_NEWTABLE.
 func natTableMessage() []byte {
 	return concat(
-		nfgenMsg(nfProtoIPv4, nfnetlinkV0, 0),
+		nfgenMsg(nfProtoIPv4, 0),
 		nlAttrString(nftaTableName, natTableName),
 	)
 }
@@ -232,7 +234,7 @@ func natTableMessage() []byte {
 // runs when jumped to.
 func natChainMessage() []byte {
 	return concat(
-		nfgenMsg(nfProtoIPv4, nfnetlinkV0, 0),
+		nfgenMsg(nfProtoIPv4, 0),
 		nlAttrString(nftaChainTable, natTableName),
 		nlAttrString(nftaChainName, natChainName),
 		nlNested(nftaChainHook,
@@ -251,7 +253,7 @@ func natChainMessage() []byte {
 // Ensure would add another copy of the same masquerade rule.
 func natFlushMessage() []byte {
 	return concat(
-		nfgenMsg(nfProtoIPv4, nfnetlinkV0, 0),
+		nfgenMsg(nfProtoIPv4, 0),
 		nlAttrString(nftaRuleTable, natTableName),
 		nlAttrString(nftaRuleChain, natChainName),
 	)
@@ -323,7 +325,7 @@ func (m *Manager) natRuleMessage() []byte {
 	)
 
 	return concat(
-		nfgenMsg(nfProtoIPv4, nfnetlinkV0, 0),
+		nfgenMsg(nfProtoIPv4, 0),
 		nlAttrString(nftaRuleTable, natTableName),
 		nlAttrString(nftaRuleChain, natChainName),
 		nlNested(nftaRuleExpressions, expressions),
@@ -388,12 +390,12 @@ func (m *Manager) buildNATBatch(startSeq uint32) natBatch {
 		typ  uint16
 		body []byte
 	}{
-		{nfnlMsgBatchBegin, nfgenMsg(unix.AF_UNSPEC, nfnetlinkV0, nfnlSubsysNFTables)},
+		{nfnlMsgBatchBegin, nfgenMsg(unix.AF_UNSPEC, nfnlSubsysNFTables)},
 		{nftMsgType(nftMsgNewTable), natTableMessage()},
 		{nftMsgType(nftMsgNewChain), natChainMessage()},
 		{nftMsgType(nftMsgDelRule), natFlushMessage()},
 		{nftMsgType(nftMsgNewRule), m.natRuleMessage()},
-		{nfnlMsgBatchEnd, nfgenMsg(unix.AF_UNSPEC, nfnetlinkV0, nfnlSubsysNFTables)},
+		{nfnlMsgBatchEnd, nfgenMsg(unix.AF_UNSPEC, nfnlSubsysNFTables)},
 	}
 
 	batch := natBatch{first: startSeq + 1}

@@ -188,7 +188,7 @@ func TestNestedRoundTrip(t *testing.T) {
 func TestIfInfoMsgLayout(t *testing.T) {
 	t.Parallel()
 
-	body := ifInfoMsg(unix.AF_UNSPEC, 7, unix.IFF_UP, unix.IFF_UP)
+	body := ifInfoMsg(7, unix.IFF_UP, unix.IFF_UP)
 
 	if len(body) != ifInfoMsgLen {
 		t.Fatalf("length = %d, want %d", len(body), ifInfoMsgLen)
@@ -256,7 +256,7 @@ func TestRtMsgLayout(t *testing.T) {
 func TestNLMessageLengthIncludesBody(t *testing.T) {
 	t.Parallel()
 
-	body := ifInfoMsg(unix.AF_UNSPEC, 1, 0, 0)
+	body := ifInfoMsg(1, 0, 0)
 	msg := nlMessage(unix.RTM_NEWLINK, unix.NLM_F_REQUEST, 99, body)
 
 	wantLen := nlMsgHdrLen + len(body)

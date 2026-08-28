@@ -112,7 +112,7 @@ func (r *Runner) Stop(ctx context.Context, id string, opts StopOptions) error {
 		return err
 	}
 
-	if err := r.finaliseRecord(log, id); err != nil {
+	if err := r.finaliseRecord(id); err != nil {
 		return err
 	}
 
@@ -258,13 +258,12 @@ func (r *Runner) awaitExit(ctx context.Context, id string, proc containerProcess
 // container running that the user asked to have stopped.
 func (r *Runner) markStopping(log *slog.Logger, id string) {
 	r.note(log, id, "the stop request", func(m *state.Metadata) error {
-		if err := m.Status.CanTransitionTo(state.StatusStopping); err != nil {
-			// Not an error the caller needs to see: a container that reached a
-			// terminal status while we were looking at it has done what was
-			// asked of it.
-			return nil
+		// A refused transition is not an error the caller needs to see: a
+		// container that reached a terminal status while we were looking at it
+		// has done what was asked of it, and the record is left as it stands.
+		if m.Status.CanTransitionTo(state.StatusStopping) == nil {
+			m.Status = state.StatusStopping
 		}
-		m.Status = state.StatusStopping
 		return nil
 	})
 }
@@ -275,7 +274,7 @@ func (r *Runner) markStopping(log *slog.Logger, id string) {
 // Only when nobody else has done it — the supervisor died with its container —
 // does this write the terminal status, and then without an exit code, because
 // the process that could have observed one no longer exists.
-func (r *Runner) finaliseRecord(log *slog.Logger, id string) error {
+func (r *Runner) finaliseRecord(id string) error {
 	err := r.state.Update(id, func(m *state.Metadata) error {
 		if m.Status.Terminal() {
 			return nil
